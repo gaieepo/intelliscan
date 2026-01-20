@@ -1,103 +1,214 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Batch Object Detection Inference
+2D Object Detection Inference for 3D Semiconductor Inspection
 
-This module performs batch inference on 2D images using YOLO object detection
-models. It processes directories of images and generates bounding box coordinates
-along with visualization outputs for semiconductor component detection.
+This module performs batch 2D object detection on image slices extracted from 3D
+volumes. It uses YOLO models to detect semiconductor components (copper pillars,
+solder bumps, etc.) in horizontal and vertical view slices.
 
-Features:
-- YOLO model integration for fast inference
-- Batch processing of image directories
-- Automatic bounding box coordinate extraction
-- Visualization generation and saving
-- Support for multi-class detection with confidence scoring
+The detection workflow processes all images in a directory, generates bounding box
+predictions, and saves both coordinate files and visualizations.
 
-Author: Wang Jie
-Date: 1st Aug 2025
-Version: 1.0
+Key Features:
+- YOLO-based object detection for semiconductor components
+- Batch processing of image directories (horizontal/vertical views)
+- Automatic bounding box coordinate extraction (class_id, x1, y1, x2, y2)
+- Visualization generation for quality control
+- Multi-class detection with confidence scoring
+
+Output Format:
+- Detection files: <image_name>.txt with format: class_id x1 y1 x2 y2 (one bbox per line)
+- Visualizations: Annotated images saved to visualize/ subdirectory
+
+Author: Wang Jie (original), Refactored by Claude
+Date: 1st Aug 2025 (original), January 2026 (refactored)
+Version: 2.0
 """
 
-import asyncio
 import os
+from pathlib import Path
 
-import cv2
 import numpy as np
-from PIL import Image
 from ultralytics import YOLO
 
 
-def infer_batch_yolo(model_path, input_folder, output_folder, batch_size=16):
+def run_yolo_detection(
+    model_path: str,
+    input_folder: str,
+    output_folder: str,
+    batch_size: int = 16,
+    save_visualizations: bool = True,
+) -> None:
     """
-    Perform inference on a batch of images using Detectron2.
+    Perform batch YOLO object detection on all images in a folder.
 
-    Parameters:
-    - cfg_path (str): Path to the configuration file (.yaml).
-    - model_path (str): Path to the trained model file (.pth).
-    - input_folder (str): Path to the folder containing input images.
-    - output_folder (str): Path to the folder where outputs will be saved.
+    This function processes all images in the input folder, runs YOLO detection,
+    and saves bounding box coordinates as text files. Optionally saves visualizations.
 
-    Description:
-    This function reads images from the specified folder, runs inference on each
-    image using a Detectron2 model, and saves the resulting bounding box
-    coordinates to text files in the output folder.
+    Args:
+        model_path: Path to trained YOLO model weights (.pt file)
+        input_folder: Path to folder containing input images (JPG/PNG)
+        output_folder: Path to folder where detection results will be saved
+        batch_size: Number of images to process in parallel (default: 16)
+        save_visualizations: Whether to save annotated images (default: True)
+
+    Output Structure:
+        output_folder/
+            ├── image001.txt  (bounding boxes: class_id x1 y1 x2 y2)
+            ├── image002.txt
+            └── ...
+        visualize/  (if save_visualizations=True)
+            ├── image001.jpg  (annotated images)
+            ├── image002.jpg
+            └── ...
 
     Raises:
-    - ValueError: If any of the provided paths are invalid.
+        FileNotFoundError: If model_path or input_folder doesn't exist
+        ValueError: If input_folder contains no valid images
+
+    Example:
+        >>> run_yolo_detection(
+        ...     model_path="models/detector.pt",
+        ...     input_folder="data/view1/input_images",
+        ...     output_folder="data/view1/detections"
+        ... )
     """
     # Validate inputs
-    # if not os.path.isfile(cfg_path):
-    #     raise ValueError(f"Configuration file not found: {cfg_path}")
     if not os.path.isfile(model_path):
-        raise ValueError(f"Model file not found: {model_path}")
+        raise FileNotFoundError(f"YOLO model not found: {model_path}")
     if not os.path.isdir(input_folder):
-        raise ValueError(f"Input folder not found: {input_folder}")
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder, exist_ok=True)
+        raise FileNotFoundError(f"Input folder not found: {input_folder}")
 
-    # Initialize the predictor based on the trainer type
-    # Load configurations and model weights
+    # Create output folder
+    os.makedirs(output_folder, exist_ok=True)
+    print(f"Detection output folder: {output_folder}")
+
+    # Create visualization folder if needed
+    if save_visualizations:
+        vis_folder = Path(output_folder).parent / "visualize"
+        os.makedirs(vis_folder, exist_ok=True)
+        print(f"Visualization folder: {vis_folder}")
+
+    # Load YOLO model
+    print(f"Loading YOLO model from: {model_path}")
     model = YOLO(model_path)
 
-    # Create visualization folder
-    vis_folder = os.path.join(os.path.dirname(output_folder), "visualize")
-    os.makedirs(vis_folder, exist_ok=True)
+    # Run batch prediction
+    print(f"Running detection on images in: {input_folder}")
+    results = model.predict(source=input_folder, batch=batch_size, verbose=True)
 
-    images = []
-    filenames = []
+    if len(results) == 0:
+        raise ValueError(f"No images processed from {input_folder}. Check folder contents.")
 
-    results = model.predict(source=input_folder)
+    # Process each result
+    num_detections_total = 0
+    for result in results:
+        filename = Path(result.path).stem
 
-    for res in results:
-        if len(res) > 0:
-            # Save bounding box coordinates
-            filename = os.path.basename(res.path)
-            output_path = os.path.join(output_folder, filename[:-4] + ".txt")
-            class_id = res.boxes.cls.cpu().numpy()
-            bb = res.boxes.xyxy.cpu().numpy()
-            np.savetxt(output_path, np.column_stack((class_id.reshape(-1, 1), bb)))
+        if result.boxes is None or len(result.boxes) == 0:
+            # No detections for this image - create empty file
+            output_path = os.path.join(output_folder, f"{filename}.txt")
+            Path(output_path).touch()
+            continue
 
-            # Save visualization
-            vis_path = os.path.join(vis_folder, filename)
-            res.save(vis_path)
+        # Extract detection information
+        class_ids = result.boxes.cls.cpu().numpy()
+        bboxes = result.boxes.xyxy.cpu().numpy()  # xyxy format: x1, y1, x2, y2
+        num_detections = len(class_ids)
+        num_detections_total += num_detections
+
+        # Save bounding box coordinates: [class_id, x1, y1, x2, y2]
+        output_path = os.path.join(output_folder, f"{filename}.txt")
+        detection_data = np.column_stack((class_ids.reshape(-1, 1), bboxes))
+        np.savetxt(output_path, detection_data, fmt="%d %.2f %.2f %.2f %.2f")
+
+        # Save visualization if enabled
+        if save_visualizations:
+            vis_path = os.path.join(str(vis_folder), f"{filename}.jpg")
+            result.save(vis_path)
+
+    print(f"✓ Processed {len(results)} images with {num_detections_total} total detections")
+    print(f"  Detection files saved to: {output_folder}")
+    if save_visualizations:
+        print(f"  Visualizations saved to: {vis_folder}")
 
 
-def infer_batch_l(in_list):
+# ============================================================================
+# Convenience Functions
+# ============================================================================
+
+
+def detect_from_views(
+    model_path: str,
+    view1_folder: str,
+    view2_folder: str,
+    output_base_folder: str,
+    batch_size: int = 16,
+) -> tuple[str, str]:
     """
-    Wrapper for infer_batch to process a list of parameters.
+    Run detection on both horizontal and vertical view folders.
 
-    Parameters:
-    - in_list (list): A list of 3 parameters in order:
-        - [0]: Path to the model file (.pth).
-        - [1]: Path to the folder containing input images.
-        - [2]: Path to the output folder.
+    Convenience function to process both views with a single model.
 
-    Raises:
-    - ValueError: If the input list does not contain exactly 4 elements.
+    Args:
+        model_path: Path to YOLO model weights
+        view1_folder: Path to horizontal view images
+        view2_folder: Path to vertical view images
+        output_base_folder: Base output folder (will create view1/view2 subfolders)
+        batch_size: Batch size for inference
+
+    Returns:
+        Tuple of (view1_output_folder, view2_output_folder)
+
+    Example:
+        >>> detect_from_views(
+        ...     model_path="models/detector.pt",
+        ...     view1_folder="output/sample1/view1/input_images",
+        ...     view2_folder="output/sample1/view2/input_images",
+        ...     output_base_folder="output/sample1"
+        ... )
     """
-    if len(in_list) != 3:
-        raise ValueError("Expected a list of 3 parameters: [model_path, input_folder, output_folder]")
+    view1_output = os.path.join(output_base_folder, "view1", "detections")
+    view2_output = os.path.join(output_base_folder, "view2", "detections")
 
-    model_path, input_folder, output_folder = in_list
-    infer_batch_yolo(model_path[0], input_folder, output_folder)
+    print("\n" + "=" * 60)
+    print("Running Object Detection - View 1 (Horizontal)")
+    print("=" * 60)
+    run_yolo_detection(model_path, view1_folder, view1_output, batch_size)
+
+    print("\n" + "=" * 60)
+    print("Running Object Detection - View 2 (Vertical)")
+    print("=" * 60)
+    run_yolo_detection(model_path, view2_folder, view2_output, batch_size)
+
+    return view1_output, view2_output
+
+
+# ============================================================================
+# Test/Demo
+# ============================================================================
+if __name__ == "__main__":
+    import sys
+
+    print("2D Object Detection Module v2.0")
+    print("=" * 60)
+
+    if len(sys.argv) < 4:
+        print("Usage: python infer_batch_new.py <model_path> <input_folder> <output_folder>")
+        print("\nExample:")
+        print("  python infer_batch_new.py models/detector.pt data/view1/images output/detections")
+        sys.exit(1)
+
+    model_path = sys.argv[1]
+    input_folder = sys.argv[2]
+    output_folder = sys.argv[3]
+
+    try:
+        run_yolo_detection(model_path, input_folder, output_folder)
+        print("\n✓ Detection completed successfully!")
+    except Exception as e:
+        print(f"\n✗ Error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)

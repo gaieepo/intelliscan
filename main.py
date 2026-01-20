@@ -7,8 +7,22 @@ metrology and defect detection pipeline. It orchestrates the complete workflow
 from 3D NII to 2D conversion, object detection, 3D bounding box generation,
 segmentation, and metrology analysis.
 
-Author: Wang Jie
-Date: 1st Aug 2025
+Pipeline Workflow:
+1. Convert 3D NIfTI volumes to 2D slices (horizontal & vertical views)
+2. Run YOLO object detection on 2D slices (single model for both views)
+3. Generate 3D bounding boxes from 2D detections
+4. Perform 3D semantic segmentation within bounding boxes
+5. Compute metrology measurements (BLT, void ratio, defects)
+6. Generate PDF reports with analysis
+
+Key Changes (v2.0):
+- Simplified to use single detection model for all views (was: multiple models)
+- Streamlined folder structure (no per-class detection folders)
+- Improved error handling and logging
+
+Author: Wang Jie (original), Refactored by Claude
+Date: 1st Aug 2025 (original), January 2026 (refactored)
+Version: 2.0
 """
 
 import csv
@@ -24,13 +38,11 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 
-from _version import get_version, print_version
 from conv_nii_jpg import conv
 from generate_bb3d_2 import process_images
 from generate_report import generate_pdf_report
-from infer_batch_new import infer_batch_l
-from metrology.config import cfg
-from metrology.post_process import compute_metrology_info
+from infer_batch_new import run_yolo_detection
+from metrology.post_process import MAKE_CLEAN_DEFAULT, compute_metrology_info
 from mmt import test_calculate_metric
 
 
@@ -77,121 +89,94 @@ def timer(section_name, log_file_path=None):
             print(f"Warning: Could not write to log file {log_file_path}: {e}")
 
 
-def try_cast(value):
-    """Attempts to cast a string value to appropriate Python type.
+def create_folder_structure(base_folder, views):
+    """
+    Create and organize folder structure for processing pipeline.
 
-    Converts string representations to boolean, float, or integer types
-    when possible, otherwise returns the trimmed string.
+    With single detection model, we no longer need per-class detection folders.
+    Structure:
+        base_folder/
+            view1/
+                input_images/  (2D slices for detection)
+                detections/    (detection results)
+                visualize/     (annotated images)
+            view2/
+                input_images/
+                detections/
+                visualize/
 
     Args:
-        value (str): String value to be cast
+        base_folder: Base output folder path
+        views: List of view names (e.g., ['view1', 'view2'])
 
     Returns:
-        bool|float|int|str: Appropriately typed value
+        Dictionary with folder paths for each view
     """
-    if value.lower() in ["true", "false"]:
-        return value.lower() == "true"
-    try:
-        if "." in value:
-            return float(value)
-        return int(value)
-    except (ValueError, TypeError):
-        return value.strip()
-
-
-def add_csv_file(filename, collection):
-    """Loads CSV data into a ChromaDB collection for vector search.
-
-    Processes CSV files and adds records to ChromaDB collection for
-    similarity-based retrieval and analysis.
-
-    Args:
-        filename (str): Path to the CSV file
-        collection: ChromaDB collection object
-
-    Note:
-        This function appears to be for ChromaDB integration but may not
-        be actively used in the current pipeline.
-    """
-    with open(filename, newline="", encoding="utf-8") as csvfile:
-        reader = csv.DictReader(csvfile)
-
-        ids = []
-        documents = []
-        metadatas = []
-
-        for row in reader:
-            if not row or all(v is None or str(v).strip() == "" for v in row.values()):
-                continue
-
-            row_id = str(row["id"]) if "id" in row else str(len(ids))
-            document = row.get("summary", "")  # fallback if summary missing
-
-            # Exclude id and document fields from metadata
-            metadata = {k: try_cast(v) for k, v in row.items() if k not in ["id", "summary"]}
-
-            ids.append(row_id)
-            documents.append(document)
-            metadatas.append(metadata)
-
-        # Add to Chroma
-        collection.add(ids=ids, documents=documents, metadatas=metadatas)
-        print(f"Inserted {len(ids)} records.")
-
-
-def create_folder_structure(base_folder, views, detection_classes):
-    """Creates and organizes folders for output, views, and classes."""
     folders = {}
-    if not os.path.exists(base_folder):
-        os.makedirs(base_folder)
-        print(f"Created base folder: {base_folder}")
+    os.makedirs(base_folder, exist_ok=True)
+    print(f"Created base folder: {base_folder}")
 
     for view in views:
         view_path = os.path.join(base_folder, view)
         folders[view] = {
             "input_images": os.path.join(view_path, "input_images"),
-            "detections": {},
-            "visualize": os.path.join(view_path, "visualize"),  # Add visualize folder
+            "detections": os.path.join(view_path, "detections"),
+            "visualize": os.path.join(view_path, "visualize"),
         }
-        if not os.path.exists(view_path):
-            os.makedirs(view_path)
-            print(f"Created view folder: {view_path}")
 
-        # Create input images folder
-        input_images_path = folders[view]["input_images"]
-        if not os.path.exists(input_images_path):
-            os.makedirs(input_images_path)
-            print(f"Created input images folder for {view}: {input_images_path}")
-
-        # Create visualize folder
-        vis_path = folders[view]["visualize"]
-        if not os.path.exists(vis_path):
-            os.makedirs(vis_path)
-            print(f"Created visualization folder for {view}: {vis_path}")
-
-        # Create folders for detection classes
-        for cls in range(detection_classes):
-            class_path = os.path.join(view_path, f"detections/class_{cls}")
-            folders[view]["detections"][cls] = class_path
-            if not os.path.exists(class_path):
-                os.makedirs(class_path)
-                print(f"Created detection folder for {view}, class {cls}: {class_path}")
+        # Create all folders for this view
+        for folder_type, folder_path in folders[view].items():
+            os.makedirs(folder_path, exist_ok=True)
+            print(f"Created {folder_type} folder for {view}: {folder_path}")
 
     return folders
 
 
-def run_inference(det_models, folder_structure, views):
-    """Run inference in parallel for each model-view combination."""
-    for j, models in enumerate(det_models):
-        for i, _ in enumerate(views):
-            input_folder = folder_structure[views[i]]["input_images"]
-            output_folder = folder_structure[views[i]]["detections"][j]
-            infer_batch_l([models, input_folder, output_folder])
+def run_inference(detection_model, folder_structure, views):
+    """
+    Run YOLO object detection on both views using a single model.
+
+    Args:
+        detection_model: Path to YOLO model weights (.pt file)
+        folder_structure: Dictionary containing folder paths for each view
+        views: List of view names to process
+
+    Returns:
+        None (detections saved to disk)
+    """
+    for view in views:
+        input_folder = folder_structure[view]["input_images"]
+        output_folder = folder_structure[view]["detections"]
+
+        print(f"\nRunning detection on {view}...")
+        run_yolo_detection(
+            model_path=detection_model,
+            input_folder=input_folder,
+            output_folder=output_folder,
+        )
 
 
 def process_metrology(input_folder, output_folder, clean_out_path, clean_mask, bb_3d_list):
     """
-    Processes segmented files and computes metrology information.
+    Process 3D segmented files and compute metrology measurements.
+
+    Iterates through all .nii.gz segmentation files, computes metrology
+    measurements (BLT, void ratio, pad misalignment, etc.), and separates
+    results into memory die and logic die categories.
+
+    Args:
+        input_folder: Path to folder containing segmented .nii.gz files
+        output_folder: Path to save metrology CSV reports
+        clean_out_path: Path to save cleaned/processed masks
+        clean_mask: Whether to apply morphological cleaning to masks
+        bb_3d_list: Array of 3D bounding boxes [num_classes, num_samples]
+
+    Returns:
+        Tuple of (memory_df, logic_df): DataFrames with metrology results
+
+    Output Files:
+        - memory.csv: Metrology data for memory dies
+        - logic.csv: Metrology data for logic dies
     """
     segmented_files = sorted(glob.glob(os.path.join(input_folder, "**/*.nii.gz")))
     num_files = len(segmented_files)
@@ -228,41 +213,29 @@ def process_metrology(input_folder, output_folder, clean_out_path, clean_mask, b
 
         try:
             measurements = compute_metrology_info(
-                nii_file=segmented_file, clean_mask=clean_mask, output_path=output_path if clean_mask else None
+                nii_file=segmented_file,
+                output_path=output_path if clean_mask else None,
+                clean_mask=clean_mask,
             )
 
-            # Create record with all measurements
+            # Create record with all measurements (values already in micrometers)
             record = {
                 "filename": rel_path,
                 "void_ratio_defect": measurements["void_ratio_defect"],
                 "solder_extrusion_defect": measurements["solder_extrusion_defect"],
                 "pad_misalignment_defect": measurements["pad_misalignment_defect"],
                 "bb": bb_3d_list[0, i],
-                "BLT": round(measurements["blt"] * cfg.METROLOGY.PIXEL_SIZE_UM, cfg.METROLOGY.NUM_DECIMALS),
-                "Pad_misalignment": round(
-                    measurements["pad_misalignment"] * cfg.METROLOGY.PIXEL_SIZE_UM, cfg.METROLOGY.NUM_DECIMALS
-                ),
-                "Void_to_solder_ratio": round(measurements["void_solder_ratio"], cfg.METROLOGY.NUM_DECIMALS),
+                "BLT": measurements["blt"],
+                "Pad_misalignment": measurements["pad_misalignment"],
+                "Void_to_solder_ratio": measurements["void_solder_ratio"],
                 "solder_extrusion_copper_pillar": [
-                    round(
-                        measurements["solder_extrusion_left"] * cfg.METROLOGY.PIXEL_SIZE_UM, cfg.METROLOGY.NUM_DECIMALS
-                    ),
-                    round(
-                        measurements["solder_extrusion_right"] * cfg.METROLOGY.PIXEL_SIZE_UM, cfg.METROLOGY.NUM_DECIMALS
-                    ),
-                    round(
-                        measurements["solder_extrusion_front"] * cfg.METROLOGY.PIXEL_SIZE_UM, cfg.METROLOGY.NUM_DECIMALS
-                    ),
-                    round(
-                        measurements["solder_extrusion_back"] * cfg.METROLOGY.PIXEL_SIZE_UM, cfg.METROLOGY.NUM_DECIMALS
-                    ),
+                    measurements["solder_extrusion_left"],
+                    measurements["solder_extrusion_right"],
+                    measurements["solder_extrusion_front"],
+                    measurements["solder_extrusion_back"],
                 ],
-                "pillar_width": round(
-                    measurements["pillar_width"] * cfg.METROLOGY.PIXEL_SIZE_UM, cfg.METROLOGY.NUM_DECIMALS
-                ),
-                "pillar_height": round(
-                    measurements["pillar_height"] * cfg.METROLOGY.PIXEL_SIZE_UM, cfg.METROLOGY.NUM_DECIMALS
-                ),
+                "pillar_width": measurements["pillar_width"],
+                "pillar_height": measurements["pillar_height"],
             }
 
             # Append to appropriate DataFrame
@@ -285,17 +258,13 @@ def process_metrology(input_folder, output_folder, clean_out_path, clean_mask, b
 
 
 def main():
-    # Display version information
-    print_version()
-    print(f"3D-IntelliScan Pipeline v{get_version()}")
-    print("=" * 60)
-
     # Read input files from files.txt
     with open("files.txt") as f:
         input_files = [line.strip() for line in f.readlines()]
 
     print(f"Found {len(input_files)} files to process")
 
+    # Each line in files.txt is a task
     for inputfile in input_files:
         print(f"\nProcessing file: {inputfile}")
 
@@ -309,14 +278,11 @@ def main():
         input_base_name = Path(*p_no_ext.parts[-2:])  # yields folder2/filename
         outfolder = os.path.join("output", input_base_name)
 
-        detection_model_mem = ["models/detection_model.pt"]
-        segmentation_model_mem = "models/segmentation_model.pth"
-
-        det_models = [detection_model_mem]
-        seg_models = [segmentation_model_mem]
+        # Single detection model for both views
+        detection_model = "models/detection_model.pt"
+        segmentation_model = "models/segmentation_model.pth"
 
         views = ["view1", "view2"]
-        detection_classes = len(det_models)
 
         # Initialize timing log file with header
         timing_log_path = os.path.join(outfolder, "timing.log")
@@ -331,7 +297,7 @@ def main():
 
         try:
             with timer("Folder Creation", timing_log_path):
-                folder_structure = create_folder_structure(outfolder, views, detection_classes)
+                folder_structure = create_folder_structure(outfolder, views)
 
             with timer("Converting NII to JPG", timing_log_path):
                 print("Converting NII to JPG...")
@@ -340,53 +306,49 @@ def main():
 
             with timer("Inference", timing_log_path):
                 print("Running object detection inference...")
-                run_inference(det_models, folder_structure, views)
+                run_inference(detection_model, folder_structure, views)
 
             with timer("Generating 3D bounding boxes", timing_log_path):
                 print("Generating 3D bounding boxes...")
-                bb_3d_list = []
-                for j, _ in enumerate(det_models):
-                    view1_params = [
-                        folder_structure["view1"]["detections"][j],
-                        folder_structure["view1"]["input_images"],
-                        0,
-                        len(fnmatch.filter(os.listdir(folder_structure["view1"]["input_images"]), "*.jpg")),
-                    ]
-                    view2_params = [
-                        folder_structure["view2"]["detections"][j],
-                        folder_structure["view2"]["input_images"],
-                        0,
-                        len(fnmatch.filter(os.listdir(folder_structure["view2"]["input_images"]), "*.jpg")),
-                    ]
-                    bb = process_images(
-                        view1_params, view2_params, os.path.join(outfolder, f"class_{j}_3d_bb.npy"), is_normalized=False
-                    )
-                    bb_3d_list.append(bb)
-                np.save(os.path.join(outfolder, "bb3d.npy"), np.array(bb_3d_list))
+                view1_params = [
+                    folder_structure["view1"]["detections"],
+                    folder_structure["view1"]["input_images"],
+                    0,
+                    len(fnmatch.filter(os.listdir(folder_structure["view1"]["input_images"]), "*.jpg")),
+                ]
+                view2_params = [
+                    folder_structure["view2"]["detections"],
+                    folder_structure["view2"]["input_images"],
+                    0,
+                    len(fnmatch.filter(os.listdir(folder_structure["view2"]["input_images"]), "*.jpg")),
+                ]
+                bb_3d = process_images(
+                    view1_params, view2_params, os.path.join(outfolder, "3d_bounding_boxes.npy"), is_normalized=False
+                )
+                # Save as single array (no longer list of arrays per class)
+                np.save(os.path.join(outfolder, "bb3d.npy"), bb_3d)
 
-            with timer("Testing MMT", timing_log_path):
-                bb_3d_list = np.load(os.path.join(outfolder, "bb3d.npy"))
-                print(f"3D bboxes has shape: {bb_3d_list.shape}")
+            with timer("3D Segmentation", timing_log_path):
+                bb_3d = np.load(os.path.join(outfolder, "bb3d.npy"))
+                print(f"3D bounding boxes shape: {bb_3d.shape}")
 
-                print("Testing MMT...")
+                print("Running 3D segmentation...")
                 img = nib.load(inputfile)
                 data3d = img.get_fdata()
-                new_data_3d = None  # Initialize the combined 3D data
 
-                for j, model in enumerate(seg_models):
-                    avg_metric, new_data_3d_result = test_calculate_metric(
-                        model,
-                        bb_3d_list[j],
-                        outfolder,
-                        f"class_{j}_segmentation.nii.gz",
-                        j,
-                        num_classes=5,
-                        data_3d=data3d,
-                        new_data_3d=new_data_3d,
-                        input_im=folder_structure[views[j]]["input_images"],
-                    )
-                print(f"Segmentation for class {j} completed, saved to {outfolder}")
-                new_data_3d = new_data_3d_result
+                # Run segmentation with single model
+                avg_metric, new_data_3d = test_calculate_metric(
+                    segmentation_model,
+                    bb_3d,
+                    outfolder,
+                    "segmentation.nii.gz",
+                    0,  # class index (only one class now)
+                    num_classes=5,
+                    data_3d=data3d,
+                    new_data_3d=None,
+                    input_im=folder_structure["view1"]["input_images"],
+                )
+                print(f"Segmentation completed, saved to {outfolder}")
 
             with timer("Metrology", timing_log_path):
                 # Add diagnostic prints
@@ -400,12 +362,15 @@ def main():
                 else:
                     print(f"Error: Metrology input folder does not exist: {metrology_input_path}")
 
-                bb_3d_list = np.load(os.path.join(outfolder, "bb3d.npy"))
+                bb_3d = np.load(os.path.join(outfolder, "bb3d.npy"))
+                # Reshape to match expected format [1, N] for single model
+                bb_3d_list = bb_3d.reshape(1, -1) if bb_3d.ndim == 1 else np.expand_dims(bb_3d, axis=0)
+
                 memory_df, logic_df = process_metrology(
                     input_folder=metrology_input_path,
                     output_folder=os.path.join(outfolder, "metrology"),
                     clean_out_path=os.path.join(outfolder, "cleaned_metrology"),
-                    clean_mask=cfg.METROLOGY.MAKE_CLEAN,
+                    clean_mask=MAKE_CLEAN_DEFAULT,
                     bb_3d_list=bb_3d_list,
                 )
 
