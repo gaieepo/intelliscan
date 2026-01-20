@@ -28,11 +28,85 @@ import numpy as np
 from ultralytics import YOLO
 
 
+def run_yolo_detection_inmemory(
+    model_path: str,
+    input_folder: str,
+    batch_size: int = 64,
+) -> dict[str, np.ndarray]:
+    """
+    Perform batch YOLO detection and return results in memory.
+
+    This function processes all images in the input folder and returns
+    detection results as a dictionary, avoiding file I/O overhead.
+
+    Args:
+        model_path: Path to trained YOLO model weights (.pt file)
+        input_folder: Path to folder containing input images (JPG/PNG)
+        batch_size: Number of images to process in parallel (default: 64)
+
+    Returns:
+        Dictionary mapping image filename (without extension) to detection array.
+        Each array has shape [N, 5] with columns [class_id, x1, y1, x2, y2].
+        Empty detections return an empty array with shape [0, 5].
+
+    Raises:
+        FileNotFoundError: If model_path or input_folder doesn't exist
+        ValueError: If input_folder contains no valid images
+
+    Example:
+        >>> detections = run_yolo_detection_inmemory(
+        ...     model_path="models/detector.pt",
+        ...     input_folder="data/view1/input_images"
+        ... )
+        >>> detections["image0"]  # array([[0, 100.5, 200.3, 150.2, 250.1], ...])
+    """
+    # Validate inputs
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"YOLO model not found: {model_path}")
+    if not os.path.isdir(input_folder):
+        raise FileNotFoundError(f"Input folder not found: {input_folder}")
+
+    # Load YOLO model
+    print(f"Loading YOLO model from: {model_path}")
+    model = YOLO(model_path)
+
+    # Run batch prediction
+    print(f"Running detection on images in: {input_folder}")
+    results = model.predict(source=input_folder, batch=batch_size, verbose=True)
+
+    if len(results) == 0:
+        raise ValueError(f"No images processed from {input_folder}. Check folder contents.")
+
+    # Build detection dictionary
+    detections: dict[str, np.ndarray] = {}
+    num_detections_total = 0
+
+    for result in results:
+        filename = Path(result.path).stem
+
+        if result.boxes is None or len(result.boxes) == 0:
+            # No detections - store empty array with correct shape
+            detections[filename] = np.empty((0, 5), dtype=np.float32)
+            continue
+
+        # Extract detection information
+        class_ids = result.boxes.cls.cpu().numpy()
+        bboxes = result.boxes.xyxy.cpu().numpy()  # xyxy format: x1, y1, x2, y2
+        num_detections_total += len(class_ids)
+
+        # Store as [class_id, x1, y1, x2, y2]
+        detection_data = np.column_stack((class_ids.reshape(-1, 1), bboxes)).astype(np.float32)
+        detections[filename] = detection_data
+
+    print(f"Processed {len(results)} images with {num_detections_total} total detections")
+    return detections
+
+
 def run_yolo_detection(
     model_path: str,
     input_folder: str,
     output_folder: str,
-    batch_size: int = 16,
+    batch_size: int = 64,
 ) -> None:
     """
     Perform batch YOLO object detection on all images in a folder.

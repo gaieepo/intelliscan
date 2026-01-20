@@ -23,8 +23,8 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 
-from detection import run_yolo_detection
-from merge import generate_bb3d
+from detection import run_yolo_detection, run_yolo_detection_inmemory
+from merge import generate_bb3d, generate_bb3d_inmemory
 from metrology import MAKE_CLEAN_DEFAULT, compute_metrology_from_array, compute_metrology_info
 from report import generate_pdf_report
 from segmentation import (
@@ -38,6 +38,7 @@ from utils import PipelineLogger, PipelineMetrics, create_folder_structure, log,
 
 # Pipeline configuration flags
 USE_COMBINED_SEG_METROLOGY = True  # Combines segmentation and metrology into single phase
+USE_INMEMORY_DETECTION = True  # Use in-memory detection/merge (faster, no intermediate TXT files)
 VERBOSE = True  # Print detailed logs to console (always writes to log file)
 
 
@@ -329,54 +330,110 @@ def main():
                 num_slices = view1_slices + view2_slices
                 phase.complete(count=num_slices)
 
-            with metrics.phase("2D Detection Inference") as phase:
-                log("Running object detection inference...")
+            if USE_INMEMORY_DETECTION:
+                # In-memory detection pipeline (faster, no intermediate files)
+                with metrics.phase("2D Detection Inference") as phase:
+                    log("Running object detection inference (in-memory)...")
 
-                for view in views:
-                    input_folder = folder_structure[view]["input_images"]
-                    output_folder = folder_structure[view]["detections"]
-
-                    log(f"Running detection on {view}...")
-                    run_yolo_detection(
+                    log("Running detection on view1...")
+                    view1_detections = run_yolo_detection_inmemory(
                         model_path=detection_model,
-                        input_folder=input_folder,
-                        output_folder=output_folder,
+                        input_folder=folder_structure["view1"]["input_images"],
                     )
 
-                # Count slices processed (same as JPGs generated)
-                view1_dir = Path(folder_structure["view1"]["input_images"])
-                view2_dir = Path(folder_structure["view2"]["input_images"])
-                num_slices = len(list(view1_dir.glob("*.jpg"))) + len(list(view2_dir.glob("*.jpg")))
-                phase.complete(count=num_slices)
+                    log("Running detection on view2...")
+                    view2_detections = run_yolo_detection_inmemory(
+                        model_path=detection_model,
+                        input_folder=folder_structure["view2"]["input_images"],
+                    )
 
-            with metrics.phase("3D Bounding Box Generation") as phase:
-                log("Generating 3D bounding boxes...")
-                view1_dir = Path(folder_structure["view1"]["input_images"])
-                view2_dir = Path(folder_structure["view2"]["input_images"])
-                view1_num_slices = len(list(view1_dir.glob("*.jpg")))
-                view2_num_slices = len(list(view2_dir.glob("*.jpg")))
-                view1_params = [
-                    folder_structure["view1"]["detections"],
-                    folder_structure["view1"]["input_images"],
-                    0,
-                    view1_num_slices,
-                ]
-                view2_params = [
-                    folder_structure["view2"]["detections"],
-                    folder_structure["view2"]["input_images"],
-                    0,
-                    view2_num_slices,
-                ]
-                bb_3d = generate_bb3d(
-                    view1_params, view2_params, str(outfolder / "3d_bounding_boxes.npy"), is_normalized=False
-                )
-                # Save as single array (no longer list of arrays per class)
-                np.save(outfolder / "bb3d.npy", bb_3d)
-                # Count effective slices used (slices that contributed to 3D bbox)
-                effective_slices = view1_num_slices + view2_num_slices
-                phase.complete(count=effective_slices)
+                    num_slices = len(view1_detections) + len(view2_detections)
+                    phase.complete(count=num_slices)
 
-            bb_3d = np.load(outfolder / "bb3d.npy")
+                with metrics.phase("3D Bounding Box Generation") as phase:
+                    log("Generating 3D bounding boxes (in-memory)...")
+
+                    # Get image dimensions from first image
+                    from PIL import Image
+
+                    sample_image_path = Path(folder_structure["view1"]["input_images"]) / "image0.jpg"
+                    with Image.open(sample_image_path) as img:
+                        image_dimensions = img.size  # (width, height)
+
+                    view1_num_slices = len(view1_detections)
+                    view2_num_slices = len(view2_detections)
+
+                    bb_3d = generate_bb3d_inmemory(
+                        view1_detections=view1_detections,
+                        view2_detections=view2_detections,
+                        view1_num_slices=view1_num_slices,
+                        view2_num_slices=view2_num_slices,
+                        image_dimensions=image_dimensions,
+                        output_file=str(outfolder / "3d_bounding_boxes.npy"),
+                        is_normalized=False,
+                    )
+
+                    # Save as single array
+                    np.save(outfolder / "bb3d.npy", bb_3d)
+
+                    # Free detection memory after merging
+                    del view1_detections, view2_detections
+
+                    effective_slices = view1_num_slices + view2_num_slices
+                    phase.complete(count=effective_slices)
+
+                # Explicit cleanup before loading segmentation model
+                import gc
+
+                gc.collect()
+
+            else:
+                # File-based detection pipeline (original behavior)
+                with metrics.phase("2D Detection Inference") as phase:
+                    log("Running object detection inference...")
+
+                    for view in views:
+                        input_folder = folder_structure[view]["input_images"]
+                        output_folder = folder_structure[view]["detections"]
+
+                        log(f"Running detection on {view}...")
+                        run_yolo_detection(
+                            model_path=detection_model,
+                            input_folder=input_folder,
+                            output_folder=output_folder,
+                            batch_size=64,
+                        )
+
+                    view1_dir = Path(folder_structure["view1"]["input_images"])
+                    view2_dir = Path(folder_structure["view2"]["input_images"])
+                    num_slices = len(list(view1_dir.glob("*.jpg"))) + len(list(view2_dir.glob("*.jpg")))
+                    phase.complete(count=num_slices)
+
+                with metrics.phase("3D Bounding Box Generation") as phase:
+                    log("Generating 3D bounding boxes...")
+                    view1_dir = Path(folder_structure["view1"]["input_images"])
+                    view2_dir = Path(folder_structure["view2"]["input_images"])
+                    view1_num_slices = len(list(view1_dir.glob("*.jpg")))
+                    view2_num_slices = len(list(view2_dir.glob("*.jpg")))
+                    view1_params = [
+                        folder_structure["view1"]["detections"],
+                        folder_structure["view1"]["input_images"],
+                        0,
+                        view1_num_slices,
+                    ]
+                    view2_params = [
+                        folder_structure["view2"]["detections"],
+                        folder_structure["view2"]["input_images"],
+                        0,
+                        view2_num_slices,
+                    ]
+                    bb_3d = generate_bb3d(
+                        view1_params, view2_params, str(outfolder / "3d_bounding_boxes.npy"), is_normalized=False
+                    )
+                    np.save(outfolder / "bb3d.npy", bb_3d)
+                    effective_slices = view1_num_slices + view2_num_slices
+                    phase.complete(count=effective_slices)
+
             num_bboxes = len(bb_3d) if bb_3d.ndim == 1 else bb_3d.shape[0]
             log(f"3D bounding boxes shape: {bb_3d.shape}")
 

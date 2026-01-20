@@ -268,6 +268,191 @@ def filter_bboxes(bboxes, volumes, threshold):
     return bboxes[mask], volumes[mask]
 
 
+def process_bbox_data_inmemory(
+    data: np.ndarray,
+    image_dimensions: tuple[int, int],
+    is_normalized: bool,
+    is_view2: bool = False,
+) -> np.ndarray:
+    """Process bounding box data from in-memory array.
+
+    @param data: Detection array with shape [N, 5] containing [class_id, x1, y1, x2, y2].
+    @param image_dimensions: Tuple containing the width and height of the image.
+    @param is_normalized: Boolean indicating if bbox data is normalized.
+    @param is_view2: Boolean indicating if this is view2 (uses class_id=1 filter).
+
+    @return: A numpy array of bounding boxes in format [xmin, xmax, ymin, ymax].
+    """
+    if data.size == 0:
+        return np.array([])
+
+    width, height = image_dimensions
+    n_id = 1 if is_view2 else 0
+
+    # Ensure 2D array
+    if data.ndim == 1:
+        data = data.reshape(-1, 5)
+
+    # Filter by class ID
+    data_bb = data[data[:, 0] == n_id]
+    if data_bb.size == 0:
+        return np.array([])
+
+    data_bb = data_bb[:, 1:]  # Remove class_id column
+
+    # Filter by width
+    widths = data_bb[:, 2] - data_bb[:, 0]
+    data_filtered = data_bb[widths < 150]
+    if data_filtered.size == 0:
+        return np.array([])
+
+    # Adjust order from [xmin, ymin, xmax, ymax] to [xmin, xmax, ymin, ymax]
+    result = data_filtered[:, [0, 2, 1, 3]]
+
+    if is_normalized:
+        result[:, [0, 2]] *= width
+        result[:, [1, 3]] *= height
+
+    return np.round(result).astype(int)
+
+
+def merge_2d_bboxes_into_3d_inmemory(
+    image_range: range,
+    detections: dict[str, np.ndarray],
+    image_dimensions: tuple[int, int],
+    is_normalized: bool,
+    is_view2: bool = False,
+) -> np.ndarray:
+    """Merge 2D bounding boxes from in-memory detections into 3D bounding boxes.
+
+    This function processes bounding boxes from in-memory detection results and merges
+    them into 3D bounding boxes based on spatial overlap (IoU) and temporal proximity.
+
+    @param image_range: A range object defining the indices of images to process.
+    @param detections: Dictionary mapping image filename (e.g., "image0") to detection
+        arrays with shape [N, 5] containing [class_id, x1, y1, x2, y2].
+    @param image_dimensions: Tuple of (width, height) for the images.
+    @param is_normalized: Flag indicating if bbox coordinates are normalized.
+    @param is_view2: Flag indicating if this is view2 (uses class_id=1 filter).
+
+    @return: An array of merged 3D bounding boxes,
+        each represented by [xmin, xmax, ymin, ymax, first_seen, last_seen].
+    """
+    jump_threshold = 10
+    intersection_threshold = 0.2
+
+    max_bboxes = len(image_range) * 20
+    combined_3d_bboxes = np.empty((max_bboxes, 6), dtype=np.float64)
+    bbox_count = 0
+
+    for i in image_range:
+        filename = f"image{i}"
+
+        if filename not in detections:
+            continue
+
+        # Process detection data from memory
+        bboxes = process_bbox_data_inmemory(
+            detections[filename],
+            image_dimensions,
+            is_normalized,
+            is_view2,
+        )
+
+        if bboxes.size == 0:
+            continue
+
+        if bbox_count == 0:
+            num_new = bboxes.shape[0]
+            combined_3d_bboxes[:num_new, :4] = bboxes
+            combined_3d_bboxes[:num_new, 4] = i
+            combined_3d_bboxes[:num_new, 5] = i
+            bbox_count = num_new
+            continue
+
+        current_bboxes = combined_3d_bboxes[:bbox_count]
+
+        for bbox in bboxes:
+            ious = batch_iou(bbox[:4], current_bboxes)
+            temporal_mask = np.abs(i - current_bboxes[:, 5]) <= jump_threshold
+            valid_mask = (ious > intersection_threshold) & temporal_mask
+
+            if np.any(valid_mask):
+                valid_indices = np.where(valid_mask)[0]
+                best_idx = valid_indices[np.argmax(ious[valid_indices])]
+
+                combined_3d_bboxes[best_idx, 0] = min(bbox[0], combined_3d_bboxes[best_idx, 0])
+                combined_3d_bboxes[best_idx, 1] = max(bbox[1], combined_3d_bboxes[best_idx, 1])
+                combined_3d_bboxes[best_idx, 2] = min(bbox[2], combined_3d_bboxes[best_idx, 2])
+                combined_3d_bboxes[best_idx, 3] = max(bbox[3], combined_3d_bboxes[best_idx, 3])
+                combined_3d_bboxes[best_idx, 5] = i
+            else:
+                if bbox_count >= max_bboxes:
+                    combined_3d_bboxes = np.vstack([combined_3d_bboxes, np.empty((max_bboxes, 6))])
+                    max_bboxes *= 2
+
+                combined_3d_bboxes[bbox_count, :4] = bbox
+                combined_3d_bboxes[bbox_count, 4] = i
+                combined_3d_bboxes[bbox_count, 5] = i
+                bbox_count += 1
+
+    result = combined_3d_bboxes[:bbox_count].copy()
+    print(f"Generated {bbox_count} 3D bounding boxes.")
+    return result
+
+
+def generate_bb3d_inmemory(
+    view1_detections: dict[str, np.ndarray],
+    view2_detections: dict[str, np.ndarray],
+    view1_num_slices: int,
+    view2_num_slices: int,
+    image_dimensions: tuple[int, int],
+    output_file: str | None = None,
+    is_normalized: bool = False,
+) -> np.ndarray:
+    """Generate 3D bounding boxes from in-memory detection results.
+
+    @param view1_detections: Dictionary of detections for view1.
+    @param view2_detections: Dictionary of detections for view2.
+    @param view1_num_slices: Number of slices in view1.
+    @param view2_num_slices: Number of slices in view2.
+    @param image_dimensions: Tuple of (width, height) for the images.
+    @param output_file: Optional path for saving 3D bboxes as numpy file.
+    @param is_normalized: Whether bbox coordinates are normalized.
+
+    @return: Filtered 3D bounding boxes array.
+    """
+    image_indices = range(0, view1_num_slices)
+    image_indices1 = range(0, view2_num_slices)
+
+    combined_3d_bboxes = merge_2d_bboxes_into_3d_inmemory(
+        image_indices, view1_detections, image_dimensions, is_normalized, is_view2=False
+    )
+    combined_3d_bboxes1 = merge_2d_bboxes_into_3d_inmemory(
+        image_indices1, view2_detections, image_dimensions, is_normalized, is_view2=True
+    )
+
+    if output_file and combined_3d_bboxes is not None and combined_3d_bboxes.size > 0:
+        np.save(output_file, combined_3d_bboxes)
+        np.save(output_file[:-4] + "_1.npy", combined_3d_bboxes1)
+        print(f"3D bounding boxes with shape {combined_3d_bboxes.shape} saved to {output_file}.")
+
+    if combined_3d_bboxes.size == 0:
+        print("No 3D bounding boxes were generated.")
+        return np.empty((0, 6))
+
+    final_3d_bbox = compute_bbox_intersections(combined_3d_bboxes, combined_3d_bboxes1, view1_num_slices)
+
+    if len(final_3d_bbox) < combined_3d_bboxes.shape[0] / 2:
+        final_3d_bbox = combined_3d_bboxes.tolist()
+
+    volumes = compute_volumes(np.array(final_3d_bbox))
+    threshold = adaptive_threshold(volumes)
+    filtered_bboxes, _ = filter_bboxes(np.array(final_3d_bbox), volumes, threshold)
+
+    return filtered_bboxes
+
+
 def merge_2d_bboxes_into_3d(image_range: range, bbox_dir: str, image_dir: str, is_normalized: bool) -> np.ndarray:
     """Merge 2D bounding boxes from a series of images into 3D bounding boxes.
 
