@@ -179,6 +179,37 @@ def calculate_intersection_over_union(bbox_a, bbox_b):
     return iou
 
 
+def batch_iou(bbox, existing_bboxes):
+    """Calculate IoU between one bbox and an array of existing bboxes - vectorized.
+
+    @param bbox: Single bounding box [xmin, xmax, ymin, ymax].
+    @param existing_bboxes: Array of bboxes [N, 6] where first 4 cols are [xmin, xmax, ymin, ymax].
+
+    @return: Array of IoU scores [N].
+    """
+    if len(existing_bboxes) == 0:
+        return np.array([])
+
+    # Extract coordinates
+    xA = np.maximum(bbox[0], existing_bboxes[:, 0])
+    xB = np.minimum(bbox[1], existing_bboxes[:, 1])
+    yA = np.maximum(bbox[2], existing_bboxes[:, 2])
+    yB = np.minimum(bbox[3], existing_bboxes[:, 3])
+
+    # Intersection area
+    inter_area = np.maximum(0, xB - xA) * np.maximum(0, yB - yA)
+
+    # Areas
+    bbox_area = (bbox[1] - bbox[0]) * (bbox[3] - bbox[2])
+    existing_areas = (existing_bboxes[:, 1] - existing_bboxes[:, 0]) * (existing_bboxes[:, 3] - existing_bboxes[:, 2])
+
+    # IoU
+    union_area = bbox_area + existing_areas - inter_area
+    iou = np.where(union_area > 0, inter_area / union_area, 0)
+
+    return iou
+
+
 def compute_volumes(bboxes):
     """
     Compute the volume of each 3D bounding box.
@@ -255,72 +286,89 @@ def merge_2d_bboxes_into_3d(image_range: range, bbox_dir: str, image_dir: str, i
     # Thresholds for deciding when to merge bounding boxes
     jump_threshold = 10  # Temporal jump threshold for merging bounding boxes
     intersection_threshold = 0.2  # IoU threshold for merging
-    minimum_span = 5  # Minimum number of slices a 3D bounding box must span
 
-    # Initialize an empty array for combined 3D bounding boxes
-    combined_3d_bboxes = np.empty((0, 6))
+    # Pre-allocate array for combined 3D bounding boxes (avoid repeated vstack)
+    max_bboxes = len(image_range) * 20  # Estimate: ~20 bboxes per slice max
+    combined_3d_bboxes = np.empty((max_bboxes, 6), dtype=np.float64)
+    bbox_count = 0
+
+    # Cache image dimensions - read from first image only
+    cached_dims = None
+    for i in image_range:
+        image_path = f"{image_dir}/image{i}.jpg"
+        if os.path.exists(image_path):
+            image = imread(image_path)
+            cached_dims = (image.shape[1], image.shape[0])  # (width, height)
+            break
+
+    if cached_dims is None:
+        print("No images found in range. Returning empty array.")
+        return np.empty((0, 6))
+
+    width, height = cached_dims
 
     # Process each image in the specified range
     for i in image_range:
-        # print(f"Processing image {i}")
-        bbox_file_path = f"{bbox_dir}/image{i}.txt"  # Path to the bounding box file for the current image
-        image_path = f"{image_dir}/image{i}.jpg"  # Path to the current image
-
-        # Early break if the image does not exist
-        if not os.path.exists(image_path):
-            print(f"Image {i} does not exist. Stopping early.")
-            break
-
-        image = imread(image_path)
-        height, width = image.shape[:2]  # Extract image dimensions
+        bbox_file_path = f"{bbox_dir}/image{i}.txt"
 
         if not os.path.exists(bbox_file_path):
             continue
 
-        # Load 2D bounding boxes for the current image
+        # Load 2D bounding boxes for the current image (using cached dimensions)
         bboxes = load_bbox_data(bbox_file_path, (width, height), is_normalized)
 
         # Skip processing if no bounding boxes are found
         if bboxes.size == 0:
             continue
 
-        # If no 3D bounding boxes have been combined yet, initialize with the bounding boxes from the first image
-        if combined_3d_bboxes.size == 0:
-            # Run only once
-            combined_3d_bboxes = np.hstack((bboxes, np.tile([i, i], (bboxes.shape[0], 1))))
+        # If no 3D bounding boxes have been combined yet, initialize with bboxes from first valid image
+        if bbox_count == 0:
+            num_new = bboxes.shape[0]
+            combined_3d_bboxes[:num_new, :4] = bboxes
+            combined_3d_bboxes[:num_new, 4] = i  # first_seen
+            combined_3d_bboxes[:num_new, 5] = i  # last_seen
+            bbox_count = num_new
             continue
 
         # Attempt to merge current bounding boxes with existing 3D bounding boxes
+        current_bboxes = combined_3d_bboxes[:bbox_count]
+
         for bbox in bboxes:
-            found_overlap = False  # Flag to track if the current bbox has been merged
-            for j, existing_bbox in enumerate(combined_3d_bboxes):
-                iou = calculate_intersection_over_union(bbox[:4], existing_bbox[:4])
+            # Vectorized IoU calculation against all existing bboxes
+            ious = batch_iou(bbox[:4], current_bboxes)
 
-                # Check if the current bbox should be merged with the existing_bbox
-                if iou > intersection_threshold and abs(i - existing_bbox[5]) <= jump_threshold:
-                    # Merge the bounding boxes by updating coordinates, and first/last seen indices
-                    combined_3d_bboxes[j, :4] = [
-                        min(bbox[0], existing_bbox[0]),  # xmin
-                        max(bbox[1], existing_bbox[1]),  # xmax
-                        min(bbox[2], existing_bbox[2]),  # ymin
-                        max(bbox[3], existing_bbox[3]),  # ymax
-                    ]
-                    combined_3d_bboxes[j, 5] = i  # Update the last seen index
-                    found_overlap = True
-                    break  # Stop looking for a match after finding an overlap
+            # Find candidates: IoU > threshold AND within temporal jump threshold
+            temporal_mask = np.abs(i - current_bboxes[:, 5]) <= jump_threshold
+            valid_mask = (ious > intersection_threshold) & temporal_mask
 
-            # If no existing 3D bounding box is found to merge with, add a new 3D bounding box
-            if not found_overlap:
-                new_3d_bbox = np.hstack((bbox, [i, i]))  # Add new 3D bounding box
-                combined_3d_bboxes = np.vstack((combined_3d_bboxes, new_3d_bbox))
+            if np.any(valid_mask):
+                # Find best match (highest IoU among valid candidates)
+                valid_indices = np.where(valid_mask)[0]
+                best_idx = valid_indices[np.argmax(ious[valid_indices])]
 
-    # Filter out small bounding boxes that do not span at least minimum_span slices
-    span = combined_3d_bboxes[:, 5] - combined_3d_bboxes[:, 4]
-    sufficient_span = span >= minimum_span
-    filtered_3d_bboxes = combined_3d_bboxes
-    print(f"Filtered 3D bounding boxes from shape {combined_3d_bboxes.shape} to {filtered_3d_bboxes.shape}.")
+                # Merge: update coordinates and last_seen
+                combined_3d_bboxes[best_idx, 0] = min(bbox[0], combined_3d_bboxes[best_idx, 0])
+                combined_3d_bboxes[best_idx, 1] = max(bbox[1], combined_3d_bboxes[best_idx, 1])
+                combined_3d_bboxes[best_idx, 2] = min(bbox[2], combined_3d_bboxes[best_idx, 2])
+                combined_3d_bboxes[best_idx, 3] = max(bbox[3], combined_3d_bboxes[best_idx, 3])
+                combined_3d_bboxes[best_idx, 5] = i
+            else:
+                # Add new 3D bounding box
+                if bbox_count >= max_bboxes:
+                    # Expand array if needed (rare case)
+                    combined_3d_bboxes = np.vstack([combined_3d_bboxes, np.empty((max_bboxes, 6))])
+                    max_bboxes *= 2
 
-    return filtered_3d_bboxes
+                combined_3d_bboxes[bbox_count, :4] = bbox
+                combined_3d_bboxes[bbox_count, 4] = i
+                combined_3d_bboxes[bbox_count, 5] = i
+                bbox_count += 1
+
+    # Trim to actual size
+    result = combined_3d_bboxes[:bbox_count].copy()
+    print(f"Generated {bbox_count} 3D bounding boxes.")
+
+    return result
 
 
 def generate_bb3d(view1: list, view2: list, output_file: str, is_normalized: bool = False):

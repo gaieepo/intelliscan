@@ -19,10 +19,6 @@ Key Features:
 Output Format:
 - Detection files: <image_name>.txt with format: class_id x1 y1 x2 y2 (one bbox per line)
 - Visualizations: Annotated images saved to visualize/ subdirectory
-
-Author: Wang Jie (original), Refactored by Claude
-Date: 1st Aug 2025 (original), January 2026 (refactored)
-Version: 2.0
 """
 
 import os
@@ -37,29 +33,23 @@ def run_yolo_detection(
     input_folder: str,
     output_folder: str,
     batch_size: int = 16,
-    save_visualizations: bool = True,
 ) -> None:
     """
     Perform batch YOLO object detection on all images in a folder.
 
     This function processes all images in the input folder, runs YOLO detection,
-    and saves bounding box coordinates as text files. Optionally saves visualizations.
+    and saves bounding box coordinates as text files.
 
     Args:
         model_path: Path to trained YOLO model weights (.pt file)
         input_folder: Path to folder containing input images (JPG/PNG)
         output_folder: Path to folder where detection results will be saved
         batch_size: Number of images to process in parallel (default: 16)
-        save_visualizations: Whether to save annotated images (default: True)
 
     Output Structure:
         output_folder/
             ├── image001.txt  (bounding boxes: class_id x1 y1 x2 y2)
             ├── image002.txt
-            └── ...
-        visualize/  (if save_visualizations=True)
-            ├── image001.jpg  (annotated images)
-            ├── image002.jpg
             └── ...
 
     Raises:
@@ -82,12 +72,6 @@ def run_yolo_detection(
     # Create output folder
     os.makedirs(output_folder, exist_ok=True)
     print(f"Detection output folder: {output_folder}")
-
-    # Create visualization folder if needed
-    if save_visualizations:
-        vis_folder = Path(output_folder).parent / "visualize"
-        os.makedirs(vis_folder, exist_ok=True)
-        print(f"Visualization folder: {vis_folder}")
 
     # Load YOLO model
     print(f"Loading YOLO model from: {model_path}")
@@ -122,15 +106,8 @@ def run_yolo_detection(
         detection_data = np.column_stack((class_ids.reshape(-1, 1), bboxes))
         np.savetxt(output_path, detection_data, fmt="%d %.2f %.2f %.2f %.2f")
 
-        # Save visualization if enabled
-        if save_visualizations:
-            vis_path = os.path.join(str(vis_folder), f"{filename}.jpg")
-            result.save(vis_path)
-
     print(f"✓ Processed {len(results)} images with {num_detections_total} total detections")
     print(f"  Detection files saved to: {output_folder}")
-    if save_visualizations:
-        print(f"  Visualizations saved to: {vis_folder}")
 
 
 # ============================================================================

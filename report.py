@@ -20,6 +20,7 @@ import textwrap
 from datetime import datetime
 from pathlib import Path
 
+import anthropic
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 import nibabel as nib
@@ -30,10 +31,197 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import ListedColormap
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from PyPDF2 import PdfReader, PdfWriter
+from sentence_transformers import SentenceTransformer
 
 # A4 size in inches
 A4_WIDTH = 8.27
 A4_HEIGHT = 11.69
+
+# -------------------------
+# Model Configuration
+# -------------------------
+# Toggle between "dev" (cheap/fast) and "prod" (best quality)
+MODEL_MODE = "dev"  # Change to "prod" for production
+CLAUDE_MODELS = {
+    "dev": "claude-3-5-haiku-20241022",  # Cheapest, fast - good for development
+    "prod": "claude-sonnet-4-5-20250929",  # Best quality - for production
+}
+CLAUDE_MODEL = CLAUDE_MODELS[MODEL_MODE]
+
+# -------------------------
+# RAG Configuration
+# -------------------------
+
+# Domain knowledge documents for semiconductor defect analysis
+DEFECT_KNOWLEDGE_DOCS = {
+    "defects": """
+# Void Defects:
+Void inside the solder material.
+Possible Causes: It may be related to the trap of the flux's outgas.
+Possible Solution: Reduce the flux volume; or prolong the flux activation period in the reflow profile.
+
+# Solder extrusion:
+Solder material is forced sideway away from the bump/pad area.
+Possible causes: Excessive force/temperature applied during the bonding process or excessive solder material.
+Possible solution: Reduce the bonding force or temperature applied and also reduce the solder material.
+
+# Pad misalignment:
+Bump is offset from the pad area.
+Possible reasons: Bonding offset not properly calibrated; excessive force/temperature.
+Possible solution: Execute bonding offset calibration; optimize the force and temperature/time.
+
+# Bond Line Thickness (BLT) Issues:
+Abnormal BLT values indicate improper bonding pressure or temperature.
+Possible causes: Incorrect bonding parameters, warpage, or contamination.
+Possible solution: Adjust bonding force, temperature profile, or clean contact surfaces.
+""",
+    "process": """
+# Manufacturing Process
+The 1st chip with micro-bumps is bonded to the wafer using thermo-compression process whereby the solder interconnects are formed. Subsequent chip is then bonded on underlying chip in the same manner. After which, the assembled 4 chip module on wafer went through underfilling, molding, solder ball attachment and singulation to form the final 4 chip module.
+""",
+}
+
+
+def _init_rag_components():
+    """Initialize RAG components (embedder, sections, embeddings). Lazy loaded."""
+    embedder = SentenceTransformer("BAAI/bge-small-en-v1.5")
+
+    # Split documents into sections
+    def split_sections(text):
+        return [s.strip() for s in text.split("\n#") if s.strip()]
+
+    def split_passages(section, max_chars=100):
+        return textwrap.wrap(section, max_chars)
+
+    sections, passages = [], []
+    for doc_id, raw in DEFECT_KNOWLEDGE_DOCS.items():
+        for si, sec in enumerate(split_sections(raw)):
+            section_id = f"{doc_id}_sec{si}"
+            sections.append({"id": section_id, "doc": doc_id, "text": sec})
+            for pj, p in enumerate(split_passages(sec)):
+                passages.append(
+                    {
+                        "id": f"{section_id}_p{pj}",
+                        "section_id": section_id,
+                        "doc": doc_id,
+                        "text": p,
+                    }
+                )
+
+    # Build embeddings
+    section_embs = embedder.encode([s["text"] for s in sections], normalize_embeddings=True)
+    passage_embs = embedder.encode([p["text"] for p in passages], normalize_embeddings=True)
+
+    return embedder, sections, passages, section_embs, passage_embs
+
+
+# Global RAG components (lazy initialized)
+_rag_components = None
+
+
+def _get_rag_components():
+    """Get or initialize RAG components."""
+    global _rag_components
+    if _rag_components is None:
+        _rag_components = _init_rag_components()
+    return _rag_components
+
+
+def _top_k(query_vec, matrix, k=3):
+    """Return top-k indices and similarity scores."""
+    sims = np.dot(matrix, query_vec)
+    idx = np.argsort(-sims)[:k]
+    return idx, sims[idx]
+
+
+def _hierarchical_retrieve(query, k_sections=2, k_passages=2):
+    """Perform hierarchical retrieval: first sections, then passages within those sections."""
+    embedder, sections, passages, section_embs, passage_embs = _get_rag_components()
+    q_emb = embedder.encode([query], normalize_embeddings=True)[0]
+
+    # Hop 1: sections
+    sec_idx, _ = _top_k(q_emb, section_embs, k_sections)
+    top_sections = [sections[i] for i in sec_idx]
+
+    # Hop 2: passages within retrieved sections
+    candidate_passages = [p for p in passages if p["section_id"] in [s["id"] for s in top_sections]]
+    if candidate_passages:
+        cand_embs = embedder.encode([p["text"] for p in candidate_passages], normalize_embeddings=True)
+        pas_idx, _ = _top_k(q_emb, cand_embs, k_passages)
+        top_passages = [candidate_passages[i] for i in pas_idx]
+    else:
+        top_passages = []
+
+    return top_sections, top_passages
+
+
+def _ask_claude(query, sections, passages, csv_content, api_key=None):
+    """Query Claude with RAG context and CSV data."""
+    if api_key is None:
+        api_key = os.environ.get("CLAUDE_API_KEY")
+        if not api_key:
+            raise ValueError("CLAUDE_API_KEY environment variable not set")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    section_texts = [f"[SECTION] {s['text']}" for s in sections]
+    passage_texts = [f"[PASSAGE] {p['text']}" for p in passages]
+    context = "\n\n".join(section_texts + passage_texts)
+
+    msg = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=1000,
+        system="""You are a semiconductor metrology expert. Analyze the provided defect data and give insights on:
+1. Summary of detected defects (counts and types)
+2. Patterns observed (location, characteristics)
+3. Possible root causes based on the domain knowledge provided
+4. Recommended solutions for each defect type
+
+Use the provided context for domain knowledge about defect causes and solutions.
+Be concise but thorough. Format your response with clear sections.""",
+        messages=[
+            {
+                "role": "user",
+                "content": f"Question: {query}\n\nDomain Knowledge:\n{context}\n\nMetrology Data (CSV):\n{csv_content}",
+            }
+        ],
+    )
+
+    return msg.content[0].text
+
+
+def generate_ai_analysis(csv_path, api_key=None, save_txt=True):
+    """Generate AI-powered analysis of the metrology data.
+
+    Args:
+        csv_path: Path to the metrology CSV file.
+        api_key: Optional API key (defaults to CLAUDE_API_KEY env var).
+        save_txt: If True, save the analysis to a .txt file alongside the CSV.
+    """
+    with open(csv_path) as f:
+        csv_content = f.read()
+
+    query = """Analyze this semiconductor metrology data and provide:
+1. Summary of all detected defects by type
+2. Any patterns in defect locations or characteristics
+3. Root cause analysis for each defect type found
+4. Recommended solutions to address the defects"""
+
+    sections, passages = _hierarchical_retrieve(query)
+    analysis = _ask_claude(query, sections, passages, csv_content, api_key)
+
+    # Save to text file for dev/debug reference
+    if save_txt:
+        txt_path = Path(csv_path).parent / "ai_analysis.txt"
+        with open(txt_path, "w") as f:
+            f.write("# AI Analysis Report\n")
+            f.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# Model: {CLAUDE_MODEL}\n")
+            f.write(f"# Source: {csv_path}\n")
+            f.write("-" * 60 + "\n\n")
+            f.write(analysis)
+        print(f"AI analysis saved to: {txt_path}")
+
+    return analysis
 
 
 def add_header_footer(fig, page_num, total_pages, filename, swip_code):
@@ -83,10 +271,11 @@ def get_slice(img_data, pred_data):
 
 def generate_pdf_report(
     csv_path,
-    # chroma_client,
     output_path="report.pdf",
     swip_code="SWIP-2025-011",
     input_filename=None,
+    api_key=None,
+    enable_ai_analysis=True,
 ):
     """
     Generate PDF report with analysis of semiconductor measurements.
@@ -95,7 +284,11 @@ def generate_pdf_report(
     - csv_path: path to input CSV file
     - output_path: path for output PDF
     - input_filename: name of the input file to use in report title
+    - api_key: Anthropic API key (defaults to CLAUDE_API_KEY env var)
+    - enable_ai_analysis: whether to include AI-powered analysis page (default True)
     """
+    # Determine total pages based on AI analysis
+    total_pages = 5 if enable_ai_analysis else 4
     # Read CSV
     df = pd.read_csv(csv_path)
 
@@ -129,7 +322,7 @@ def generate_pdf_report(
         axes = [fig.add_subplot(gs[i, j]) for i in range(n_rows) for j in range(n_cols)]
 
         # Add header and footer
-        add_header_footer(fig, 2, 4, filename, swip_code)
+        add_header_footer(fig, 2, total_pages, filename, swip_code)
 
         # 1. BLT Distribution
         """
@@ -248,7 +441,7 @@ def generate_pdf_report(
         cmap = ListedColormap(colors)
 
         # Add header and footer
-        add_header_footer(fig, 3, 4, filename, swip_code)
+        add_header_footer(fig, 3, total_pages, filename, swip_code)
 
         # Define thresholds
         thresholds = {
@@ -406,7 +599,7 @@ def generate_pdf_report(
         plt.axis("off")
 
         # Add header and footer
-        add_header_footer(fig, 4, 4, filename, swip_code)
+        add_header_footer(fig, 4, total_pages, filename, swip_code)
 
         # Create a table-like display for BLT and Pillar Dimensions
         table_data = [
@@ -484,6 +677,61 @@ def generate_pdf_report(
         plt.title("Summary Statistics", fontsize=14, pad=20)
         pdf.savefig(fig)
         plt.close(fig)
+
+        # 5. AI Analysis Page (optional)
+        if enable_ai_analysis:
+            fig = plt.figure(figsize=(A4_WIDTH, A4_HEIGHT))
+            plt.axis("off")
+
+            # Add header and footer
+            add_header_footer(fig, 5, total_pages, filename, swip_code)
+
+            try:
+                # Generate AI analysis
+                ai_analysis = generate_ai_analysis(csv_path, api_key)
+
+                # Wrap text for display
+                wrapped_lines = []
+                for line in ai_analysis.split("\n"):
+                    if line.strip():
+                        wrapped = textwrap.fill(line, width=90)
+                        wrapped_lines.append(wrapped)
+                    else:
+                        wrapped_lines.append("")
+                wrapped_text = "\n".join(wrapped_lines)
+
+                # Display the analysis
+                plt.text(
+                    0.05,
+                    0.85,
+                    wrapped_text,
+                    ha="left",
+                    va="top",
+                    fontsize=8,
+                    family="monospace",
+                    transform=fig.transFigure,
+                    bbox=dict(facecolor="white", edgecolor="lightgray", boxstyle="round,pad=0.5"),
+                )
+                plt.title("AI-Powered Defect Analysis", fontsize=14, pad=20)
+
+            except Exception as e:
+                # Handle API errors gracefully
+                error_msg = f"AI analysis unavailable: {str(e)}\n\n"
+                error_msg += "Please ensure CLAUDE_API_KEY environment variable is set."
+                plt.text(
+                    0.5,
+                    0.5,
+                    error_msg,
+                    ha="center",
+                    va="center",
+                    fontsize=10,
+                    transform=fig.transFigure,
+                    bbox=dict(facecolor="lightyellow", edgecolor="orange", boxstyle="round,pad=0.5"),
+                )
+                plt.title("AI-Powered Defect Analysis", fontsize=14, pad=20)
+
+            pdf.savefig(fig)
+            plt.close(fig)
 
     # --- 2. open both files and merge ---
     writer = PdfWriter()

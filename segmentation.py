@@ -14,9 +14,6 @@ Workflow:
    - Run sliding window inference
    - Apply post-processing (void filling)
 3. Assemble all predictions into full volume
-
-Author: Integration Module
-Date: January 2026
 """
 
 from __future__ import annotations
@@ -30,7 +27,6 @@ import numpy as np
 import torch
 from monai.inferers import sliding_window_inference
 from monai.networks.nets import BasicUNet
-from scipy.ndimage import label as scipy_label
 
 # =============================================================================
 # Post-processing utilities
@@ -55,6 +51,9 @@ def fill_internal_voids(
     Returns:
         Modified prediction array with internal holes relabeled
     """
+    # Lazy import - only needed when apply_void_fill is True
+    from scipy.ndimage import label as scipy_label
+
     bg_mask = prediction == background_class
     bg_labels, n_labels = scipy_label(bg_mask)
 
@@ -93,7 +92,7 @@ class SegmentationConfig:
     margin: int = 15
     num_classes: int = 5
     apply_normalization: bool = True
-    apply_void_fill: bool = True
+    apply_void_fill: bool = False  # Disabled by default for performance
     device: str = "cuda"
 
     # Normalization parameters

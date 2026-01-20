@@ -28,10 +28,6 @@ The module uses a "hamburger-stack" approach to determine correct vertical orien
 Components should stack from top to bottom as: CuPad → Solder → CuPillar
 Key insight: Even with severe solder extrusion, solder will never extend below
 the bottom surface of the copper pillar, providing a reliable structural constraint.
-
-Author: Wang Jie (original), Refactored by Claude
-Date: 1st Aug 2025 (original), January 2026 (refactored)
-Version: 2.0
 """
 
 import os
@@ -420,12 +416,15 @@ def orient_mask_vertically(mask_3d: np.ndarray) -> np.ndarray:
 # ============================================================================
 
 
-def clean_binary_mask(mask: np.ndarray, threshold: int = CLEANUP_THRESHOLD) -> np.ndarray:
+def clean_binary_mask_bounded(
+    mask: np.ndarray,
+    threshold: int = CLEANUP_THRESHOLD,
+) -> np.ndarray:
     """
-    Clean a single binary mask using morphological operations and distance filtering.
+    Clean a single binary mask using bounded distance filtering.
 
-    This removes isolated noise and spurious voxels that are far from the
-    main object's center of mass.
+    Optimized version that only computes distances within the mask's bounding box
+    plus padding, rather than the full volume.
 
     Args:
         mask: 3D binary mask array
@@ -440,21 +439,46 @@ def clean_binary_mask(mask: np.ndarray, threshold: int = CLEANUP_THRESHOLD) -> n
     # Apply morphological closing to fill small holes and connect nearby components
     mask = ndimage.binary_closing(mask, iterations=BINARY_CLOSING_ITERATIONS)
 
-    # Calculate center of mass
-    center_of_mass = ndimage.center_of_mass(mask)
+    # Get tight bounding box of the mask
+    coords = np.nonzero(mask)
+    if len(coords[0]) == 0:
+        return mask
 
-    # Create coordinate grids
-    x_coords, y_coords, z_coords = np.ogrid[: mask.shape[0], : mask.shape[1], : mask.shape[2]]
+    x_min, x_max = coords[0].min(), coords[0].max() + 1
+    y_min, y_max = coords[1].min(), coords[1].max() + 1
+    z_min, z_max = coords[2].min(), coords[2].max() + 1
+
+    # Add padding for threshold distance
+    pad = threshold + 5
+    x_min = max(0, x_min - pad)
+    x_max = min(mask.shape[0], x_max + pad)
+    y_min = max(0, y_min - pad)
+    y_max = min(mask.shape[1], y_max + pad)
+    z_min = max(0, z_min - pad)
+    z_max = min(mask.shape[2], z_max + pad)
+
+    # Extract crop
+    crop = mask[x_min:x_max, y_min:y_max, z_min:z_max]
+
+    # Calculate center of mass within crop
+    center_of_mass = ndimage.center_of_mass(crop)
+
+    # Create coordinate grids only for the crop (much smaller)
+    x_coords, y_coords, z_coords = np.ogrid[: crop.shape[0], : crop.shape[1], : crop.shape[2]]
 
     # Calculate distance from each voxel to center of mass
     distances = np.sqrt(
         (x_coords - center_of_mass[0]) ** 2 + (y_coords - center_of_mass[1]) ** 2 + (z_coords - center_of_mass[2]) ** 2
     )
 
-    # Keep only voxels within threshold distance
-    mask = mask & (distances <= threshold)
+    # Apply threshold within crop
+    crop = crop & (distances <= threshold)
 
-    return mask
+    # Place back into result
+    result = np.zeros_like(mask)
+    result[x_min:x_max, y_min:y_max, z_min:z_max] = crop
+
+    return result
 
 
 def clean_segmentation_mask(mask_3d: np.ndarray) -> np.ndarray:
@@ -462,7 +486,8 @@ def clean_segmentation_mask(mask_3d: np.ndarray) -> np.ndarray:
     Clean a multi-class 3D segmentation mask.
 
     Processes each class separately using morphological operations,
-    then recombines them into a single mask.
+    then recombines them into a single mask. Uses bounded distance
+    computation for efficiency.
 
     Args:
         mask_3d: 3D segmentation mask with integer class labels
@@ -481,15 +506,15 @@ def clean_segmentation_mask(mask_3d: np.ndarray) -> np.ndarray:
 
     print(f"Copper pillar voxels: {count_nonzero_voxels(mask_pillar)}")
 
-    # Clean non-empty masks
+    # Clean non-empty masks using bounded computation
     if count_nonzero_voxels(mask_pillar) > 0:
-        mask_pillar = clean_binary_mask(mask_pillar)
+        mask_pillar = clean_binary_mask_bounded(mask_pillar)
 
     if count_nonzero_voxels(mask_solder) > 0:
-        mask_solder = clean_binary_mask(mask_solder)
+        mask_solder = clean_binary_mask_bounded(mask_solder)
 
     if count_nonzero_voxels(mask_pad) > 0:
-        mask_pad = clean_binary_mask(mask_pad)
+        mask_pad = clean_binary_mask_bounded(mask_pad)
 
     # Note: Void mask is not cleaned to preserve all void detections
 
@@ -746,6 +771,47 @@ def compute_metrology_info(
     print("=" * 60 + "\n")
 
     return result
+
+
+def compute_metrology_from_array(
+    mask_3d: np.ndarray,
+    clean_mask: bool = MAKE_CLEAN_DEFAULT,
+    pixel_size_um: float = PIXEL_SIZE_UM,
+    num_decimals: int = NUM_DECIMALS,
+) -> dict:
+    """
+    Compute metrology information directly from a numpy array.
+
+    This function bypasses file I/O for use in combined segmentation+metrology
+    pipelines where the mask is already in memory.
+
+    Args:
+        mask_3d: 3D segmentation mask array with class labels
+        clean_mask: Whether to apply morphological cleaning
+        pixel_size_um: Pixel/voxel size in micrometers for unit conversion
+        num_decimals: Decimal places for rounding measurements
+
+    Returns:
+        Dictionary containing all metrology measurements in micrometers
+    """
+    # Clean mask if requested
+    if clean_mask:
+        mask_3d = clean_segmentation_mask(mask_3d)
+
+    # Orient mask vertically (pillar along y-axis) using structural relationships
+    try:
+        mask_3d = orient_mask_by_structure(mask_3d)
+    except ValueError:
+        mask_3d = orient_mask_vertically(mask_3d)
+
+    # Compute measurements
+    measurements = compute_measurements(mask_3d)
+
+    if measurements is None:
+        raise ValueError("Failed to compute measurements from array")
+
+    # Convert to dictionary with physical units
+    return measurements.to_dict(pixel_size_um, num_decimals)
 
 
 # ============================================================================
