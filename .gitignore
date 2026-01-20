@@ -329,6 +329,5 @@ docker-compose.override.yml
 *.tmp
 *.temp
 .claude/
-*.bak.py
-docs/
 TODO.md
+archive/

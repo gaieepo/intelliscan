@@ -12,10 +12,6 @@ Features:
 - Cross-sectional image generation with segmentation overlays
 - AI-powered analysis summaries using Claude API
 - Multi-page PDF generation with professional formatting
-
-Author: Wang Jie
-Date: 1st Aug 2025
-Version: 1.0
 """
 
 import ast

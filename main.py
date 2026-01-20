@@ -14,146 +14,29 @@ Pipeline Workflow:
 4. Perform 3D semantic segmentation within bounding boxes
 5. Compute metrology measurements (BLT, void ratio, defects)
 6. Generate PDF reports with analysis
-
-Key Changes (v2.0):
-- Simplified to use single detection model for all views (was: multiple models)
-- Streamlined folder structure (no per-class detection folders)
-- Improved error handling and logging
-
-Author: Wang Jie (original), Refactored by Claude
-Date: 1st Aug 2025 (original), January 2026 (refactored)
-Version: 2.0
 """
 
-import csv
 import fnmatch
 import glob
 import os
-import time
 import traceback
-from contextlib import contextmanager
 from pathlib import Path
 
 import nibabel as nib
 import numpy as np
 import pandas as pd
 
-from conv_nii_jpg import conv
-from generate_bb3d_2 import process_images
-from generate_report import generate_pdf_report
-from infer_batch_new import run_yolo_detection
-from metrology.post_process import MAKE_CLEAN_DEFAULT, compute_metrology_info
-from mmt import test_calculate_metric
-
-
-@contextmanager
-def timer(section_name, log_file_path=None):
-    """Context manager for timing and logging code execution blocks.
-
-    Measures execution time of code blocks and optionally logs results
-    to a specified file with timestamps.
-
-    Args:
-        section_name (str): Descriptive name for the timed section
-        log_file_path (str, optional): Path to log file for timing records
-
-    Yields:
-        None: Control is passed to the with-block code
-
-    Example:
-        >>> with timer("Data Processing", "timing.log"):
-        ...     # Code to be timed
-        ...     process_data()
-    """
-    start_time = time.time()
-    yield
-    elapsed_time = time.time() - start_time
-
-    # Format the timing message
-    timing_message = f"[{section_name}] completed in {elapsed_time:.2f} seconds."
-
-    # Print to console
-    print(timing_message)
-
-    # Write to log file if path is provided
-    if log_file_path:
-        try:
-            # Ensure the directory exists
-            os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
-
-            # Append timing information to log file
-            with open(log_file_path, "a", encoding="utf-8") as log_file:
-                timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
-                log_file.write(f"{timestamp} - {timing_message}\n")
-        except Exception as e:
-            print(f"Warning: Could not write to log file {log_file_path}: {e}")
-
-
-def create_folder_structure(base_folder, views):
-    """
-    Create and organize folder structure for processing pipeline.
-
-    With single detection model, we no longer need per-class detection folders.
-    Structure:
-        base_folder/
-            view1/
-                input_images/  (2D slices for detection)
-                detections/    (detection results)
-                visualize/     (annotated images)
-            view2/
-                input_images/
-                detections/
-                visualize/
-
-    Args:
-        base_folder: Base output folder path
-        views: List of view names (e.g., ['view1', 'view2'])
-
-    Returns:
-        Dictionary with folder paths for each view
-    """
-    folders = {}
-    os.makedirs(base_folder, exist_ok=True)
-    print(f"Created base folder: {base_folder}")
-
-    for view in views:
-        view_path = os.path.join(base_folder, view)
-        folders[view] = {
-            "input_images": os.path.join(view_path, "input_images"),
-            "detections": os.path.join(view_path, "detections"),
-            "visualize": os.path.join(view_path, "visualize"),
-        }
-
-        # Create all folders for this view
-        for folder_type, folder_path in folders[view].items():
-            os.makedirs(folder_path, exist_ok=True)
-            print(f"Created {folder_type} folder for {view}: {folder_path}")
-
-    return folders
-
-
-def run_inference(detection_model, folder_structure, views):
-    """
-    Run YOLO object detection on both views using a single model.
-
-    Args:
-        detection_model: Path to YOLO model weights (.pt file)
-        folder_structure: Dictionary containing folder paths for each view
-        views: List of view names to process
-
-    Returns:
-        None (detections saved to disk)
-    """
-    for view in views:
-        input_folder = folder_structure[view]["input_images"]
-        output_folder = folder_structure[view]["detections"]
-
-        print(f"\nRunning detection on {view}...")
-        run_yolo_detection(
-            model_path=detection_model,
-            input_folder=input_folder,
-            output_folder=output_folder,
-        )
+from detection import run_yolo_detection
+from merge import generate_bb3d
+from metrology import MAKE_CLEAN_DEFAULT, compute_metrology_info
+from report import generate_pdf_report
+from segmentation import (
+    SegmentationConfig,
+    SegmentationInference,
+    assemble_full_volume,
+    segment_bboxes,
+)
+from utils import PipelineMetrics, create_folder_structure, nii2jpg
 
 
 def process_metrology(input_folder, output_folder, clean_out_path, clean_mask, bb_3d_list):
@@ -161,8 +44,7 @@ def process_metrology(input_folder, output_folder, clean_out_path, clean_mask, b
     Process 3D segmented files and compute metrology measurements.
 
     Iterates through all .nii.gz segmentation files, computes metrology
-    measurements (BLT, void ratio, pad misalignment, etc.), and separates
-    results into memory die and logic die categories.
+    measurements (BLT, void ratio, pad misalignment, etc.).
 
     Args:
         input_folder: Path to folder containing segmented .nii.gz files
@@ -172,13 +54,12 @@ def process_metrology(input_folder, output_folder, clean_out_path, clean_mask, b
         bb_3d_list: Array of 3D bounding boxes [num_classes, num_samples]
 
     Returns:
-        Tuple of (memory_df, logic_df): DataFrames with metrology results
+        DataFrame with metrology results for all samples
 
     Output Files:
-        - memory.csv: Metrology data for memory dies
-        - logic.csv: Metrology data for logic dies
+        - metrology.csv: Metrology data for all samples (memory and logic dies)
     """
-    segmented_files = sorted(glob.glob(os.path.join(input_folder, "**/*.nii.gz")))
+    segmented_files = sorted(glob.glob(os.path.join(input_folder, "**/*.nii.gz"), recursive=True))
     num_files = len(segmented_files)
     print(f"Number of segmented files to process: {num_files}")
 
@@ -187,9 +68,10 @@ def process_metrology(input_folder, output_folder, clean_out_path, clean_mask, b
     if clean_mask:
         os.makedirs(clean_out_path, exist_ok=True)
 
-    # Initialize DataFrames with all expected columns
-    memory_columns = [
+    # Initialize DataFrame with all expected columns
+    columns = [
         "filename",
+        "is_memory",
         "void_ratio_defect",
         "solder_extrusion_defect",
         "pad_misalignment_defect",
@@ -202,8 +84,7 @@ def process_metrology(input_folder, output_folder, clean_out_path, clean_mask, b
         "pillar_height",
     ]
 
-    memory_df = pd.DataFrame(columns=memory_columns)
-    logic_df = pd.DataFrame(columns=memory_columns)  # Using same columns for now
+    metrology_df = pd.DataFrame(columns=columns)
 
     for i, segmented_file in enumerate(segmented_files):
         print(f"Processing file {i + 1}/{num_files}: {segmented_file}")
@@ -221,6 +102,7 @@ def process_metrology(input_folder, output_folder, clean_out_path, clean_mask, b
             # Create record with all measurements (values already in micrometers)
             record = {
                 "filename": rel_path,
+                "is_memory": measurements["is_memory"],
                 "void_ratio_defect": measurements["void_ratio_defect"],
                 "solder_extrusion_defect": measurements["solder_extrusion_defect"],
                 "pad_misalignment_defect": measurements["pad_misalignment_defect"],
@@ -238,11 +120,8 @@ def process_metrology(input_folder, output_folder, clean_out_path, clean_mask, b
                 "pillar_height": measurements["pillar_height"],
             }
 
-            # Append to appropriate DataFrame
-            if measurements["is_memory"]:
-                memory_df = pd.concat([memory_df, pd.DataFrame([record])], ignore_index=True)
-            else:
-                logic_df = pd.concat([logic_df, pd.DataFrame([record])], ignore_index=True)
+            # Append to DataFrame
+            metrology_df = pd.concat([metrology_df, pd.DataFrame([record])], ignore_index=True)
 
         except Exception as e:
             print(f"Error processing file {segmented_file}")
@@ -250,11 +129,10 @@ def process_metrology(input_folder, output_folder, clean_out_path, clean_mask, b
             print("Stack trace:", traceback.format_exc())
             continue
 
-    # Save DataFrames to CSV
-    memory_df.to_csv(os.path.join(output_folder, "memory.csv"), index=False)
-    logic_df.to_csv(os.path.join(output_folder, "logic.csv"), index=False)
+    # Save DataFrame to CSV
+    metrology_df.to_csv(os.path.join(output_folder, "metrology.csv"), index=False)
 
-    return memory_df, logic_df
+    return metrology_df
 
 
 def main():
@@ -277,87 +155,114 @@ def main():
         # Remove the first folder by taking all parts except the first one
         input_base_name = Path(*p_no_ext.parts[-2:])  # yields folder2/filename
         outfolder = os.path.join("output", input_base_name)
+        os.makedirs(outfolder, exist_ok=True)
 
         # Single detection model for both views
         detection_model = "models/detection_model.pt"
-        segmentation_model = "models/segmentation_model.pth"
+        segmentation_model = "models/segmentation_model.ckpt"
 
         views = ["view1", "view2"]
 
-        # Initialize timing log file with header
-        timing_log_path = os.path.join(outfolder, "timing.log")
-        try:
-            os.makedirs(outfolder, exist_ok=True)
-            with open(timing_log_path, "w", encoding="utf-8") as log_file:
-                log_file.write(f"=== Timing Log for {inputfile} ===\n")
-                log_file.write(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                log_file.write("=" * 50 + "\n\n")
-        except Exception as e:
-            print(f"Warning: Could not initialize log file {timing_log_path}: {e}")
+        # Initialize pipeline metrics for this task
+        metrics = PipelineMetrics(task_id=inputfile)
 
         try:
-            with timer("Folder Creation", timing_log_path):
+            with metrics.phase("Folder Creation"):
                 folder_structure = create_folder_structure(outfolder, views)
 
-            with timer("Converting NII to JPG", timing_log_path):
+            with metrics.phase("NII to JPG Conversion") as p:
                 print("Converting NII to JPG...")
-                conv(inputfile, folder_structure["view1"]["input_images"], 0)
-                conv(inputfile, folder_structure["view2"]["input_images"], 1)
+                nii2jpg(inputfile, folder_structure["view1"]["input_images"], 0)
+                nii2jpg(inputfile, folder_structure["view2"]["input_images"], 1)
+                # Count total slices generated across both views
+                num_slices = len(fnmatch.filter(os.listdir(folder_structure["view1"]["input_images"]), "*.jpg")) + len(
+                    fnmatch.filter(os.listdir(folder_structure["view2"]["input_images"]), "*.jpg")
+                )
+                p.complete(count=num_slices)
 
-            with timer("Inference", timing_log_path):
+            with metrics.phase("2D Detection Inference") as p:
                 print("Running object detection inference...")
-                run_inference(detection_model, folder_structure, views)
 
-            with timer("Generating 3D bounding boxes", timing_log_path):
+                for view in views:
+                    input_folder = folder_structure[view]["input_images"]
+                    output_folder = folder_structure[view]["detections"]
+
+                    print(f"\nRunning detection on {view}...")
+                    run_yolo_detection(
+                        model_path=detection_model,
+                        input_folder=input_folder,
+                        output_folder=output_folder,
+                    )
+
+                # Count slices processed (same as JPGs generated)
+                num_slices = len(fnmatch.filter(os.listdir(folder_structure["view1"]["input_images"]), "*.jpg")) + len(
+                    fnmatch.filter(os.listdir(folder_structure["view2"]["input_images"]), "*.jpg")
+                )
+                p.complete(count=num_slices)
+
+            with metrics.phase("3D Bounding Box Generation") as p:
                 print("Generating 3D bounding boxes...")
+                view1_num_slices = len(fnmatch.filter(os.listdir(folder_structure["view1"]["input_images"]), "*.jpg"))
+                view2_num_slices = len(fnmatch.filter(os.listdir(folder_structure["view2"]["input_images"]), "*.jpg"))
                 view1_params = [
                     folder_structure["view1"]["detections"],
                     folder_structure["view1"]["input_images"],
                     0,
-                    len(fnmatch.filter(os.listdir(folder_structure["view1"]["input_images"]), "*.jpg")),
+                    view1_num_slices,
                 ]
                 view2_params = [
                     folder_structure["view2"]["detections"],
                     folder_structure["view2"]["input_images"],
                     0,
-                    len(fnmatch.filter(os.listdir(folder_structure["view2"]["input_images"]), "*.jpg")),
+                    view2_num_slices,
                 ]
-                bb_3d = process_images(
+                bb_3d = generate_bb3d(
                     view1_params, view2_params, os.path.join(outfolder, "3d_bounding_boxes.npy"), is_normalized=False
                 )
                 # Save as single array (no longer list of arrays per class)
                 np.save(os.path.join(outfolder, "bb3d.npy"), bb_3d)
+                # Count effective slices used (slices that contributed to 3D bbox)
+                effective_slices = view1_num_slices + view2_num_slices
+                p.complete(count=effective_slices)
 
-            with timer("3D Segmentation", timing_log_path):
+            with metrics.phase("3D Segmentation") as p:
                 bb_3d = np.load(os.path.join(outfolder, "bb3d.npy"))
+                num_bboxes = len(bb_3d) if bb_3d.ndim == 1 else bb_3d.shape[0]
                 print(f"3D bounding boxes shape: {bb_3d.shape}")
 
                 print("Running 3D segmentation...")
                 img = nib.load(inputfile)
                 data3d = img.get_fdata()
 
-                # Run segmentation with single model
-                avg_metric, new_data_3d = test_calculate_metric(
-                    segmentation_model,
-                    bb_3d,
-                    outfolder,
-                    "segmentation.nii.gz",
-                    0,  # class index (only one class now)
-                    num_classes=5,
-                    data_3d=data3d,
-                    new_data_3d=None,
-                    input_im=folder_structure["view1"]["input_images"],
+                # Create output directories for per-bbox results (metrology compatibility)
+                seg_output_dir = Path(outfolder) / "mmt"
+                (seg_output_dir / "img").mkdir(parents=True, exist_ok=True)
+                (seg_output_dir / "pred").mkdir(parents=True, exist_ok=True)
+
+                # Initialize segmentation engine
+                engine = SegmentationInference(segmentation_model, SegmentationConfig())
+
+                # Segment all bounding boxes
+                results = segment_bboxes(engine, data3d, bb_3d, save_dir=seg_output_dir)
+
+                # Assemble into full volume and save
+                full_segmentation = assemble_full_volume(results, data3d.shape)
+                nib.save(
+                    nib.Nifti1Image(full_segmentation, np.eye(4)),
+                    os.path.join(outfolder, "segmentation.nii.gz"),
                 )
                 print(f"Segmentation completed, saved to {outfolder}")
+                # Count 3D bboxes provided to segmentation
+                p.complete(count=num_bboxes)
 
-            with timer("Metrology", timing_log_path):
-                # Add diagnostic prints
+            with metrics.phase("Metrology") as p:
                 metrology_input_path = os.path.join(outfolder, "mmt", "pred")
                 print(f"Checking metrology input folder: {metrology_input_path}")
+                mask_files = []
                 if os.path.exists(metrology_input_path):
-                    files = glob.glob(os.path.join(metrology_input_path, "**/*.nii.gz"))
-                    print(f"Found {len(files)} .nii.gz files to process")
-                    if len(files) == 0:
+                    mask_files = glob.glob(os.path.join(metrology_input_path, "**/*.nii.gz"), recursive=True)
+                    print(f"Found {len(mask_files)} .nii.gz files to process")
+                    if len(mask_files) == 0:
                         print("No files found! Check if previous steps generated the required files.")
                 else:
                     print(f"Error: Metrology input folder does not exist: {metrology_input_path}")
@@ -366,21 +271,27 @@ def main():
                 # Reshape to match expected format [1, N] for single model
                 bb_3d_list = bb_3d.reshape(1, -1) if bb_3d.ndim == 1 else np.expand_dims(bb_3d, axis=0)
 
-                memory_df, logic_df = process_metrology(
+                metrology_df = process_metrology(
                     input_folder=metrology_input_path,
                     output_folder=os.path.join(outfolder, "metrology"),
                     clean_out_path=os.path.join(outfolder, "cleaned_metrology"),
                     clean_mask=MAKE_CLEAN_DEFAULT,
                     bb_3d_list=bb_3d_list,
                 )
+                # Count 3D masks loaded to metrology
+                p.complete(count=len(mask_files))
 
-            outf = os.path.join(outfolder, "metrology", "memory_report.pdf")
-            with timer("Analysis", timing_log_path):
+            outf = os.path.join(outfolder, "metrology", "metrology_report.pdf")
+            with metrics.phase("Report Generation"):
                 generate_pdf_report(
-                    os.path.join(outfolder, "metrology", "memory.csv"),
+                    os.path.join(outfolder, "metrology", "metrology.csv"),
                     outf,
                     input_filename=os.path.basename(inputfile),
                 )
+
+            # Save metrics for this task
+            metrics.write_log(os.path.join(outfolder, "timing.log"))
+            metrics.save(os.path.join(outfolder, "metrics.json"))
 
             print(f"Successfully processed {inputfile}")
             outf2 = os.path.dirname(outf)
@@ -388,6 +299,9 @@ def main():
 
         except Exception as e:
             print(f"Error processing {inputfile}: {str(e)}")
+            # Still save partial metrics on error
+            metrics.write_log(os.path.join(outfolder, "timing.log"))
+            metrics.save(os.path.join(outfolder, "metrics.json"))
             continue
 
 

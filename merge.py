@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 3D Bounding Box Generator
 
-This module converts 2D bounding box detections from multiple views into robust 
-3D bounding boxes through advanced geometric intersection and temporal tracking 
-algorithms. It processes dual-view detection results and generates optimized 
+This module converts 2D bounding box detections from multiple views into robust
+3D bounding boxes through advanced geometric intersection and temporal tracking
+algorithms. It processes dual-view detection results and generates optimized
 3D object localization for semiconductor inspection.
 
 Key Features:
@@ -14,21 +13,15 @@ Key Features:
 - Adaptive volume-based filtering using K-means clustering
 - Cross-view geometric intersection computation
 - Robust handling of detection gaps and noise
-
-Author: Wang Jie
-Date: 1st Aug 2025
-Version: 1.0
 """
 
 import os
 import sys
-from typing import Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 from skimage.io import imread
-
 from sklearn.cluster import KMeans
-import matplotlib.pyplot as plt
 
 
 # Function to compute the intersection of two 3D bounding boxes
@@ -63,8 +56,6 @@ def intersect_bbox(bbox1, bbox2):
         return None
 
 
-
-
 # Function to compute the intersection of all bounding boxes in two lists, considering orientation differences
 def compute_bbox_intersections(S1_bboxes, S2_bboxes, sizeY):
     """
@@ -82,21 +73,20 @@ def compute_bbox_intersections(S1_bboxes, S2_bboxes, sizeY):
     """
 
     intersections = []
-    
 
     # Iterate through bounding boxes in S1
     for bbox1 in S1_bboxes:
         # Iterate through bounding boxes in S2
         for bbox2 in S2_bboxes:
             # Swap the ymin-ymax with zmin-zmax for bbox2 to align with S1's orientation
-            
+
             bbox2_aligned = [
                 bbox2[0],  # xmin remains the same
                 bbox2[1],  # xmax remains the same
                 bbox2[4],  # swap ymin with zmin
                 bbox2[5],  # swap ymax with zmax
                 bbox2[2],
-                bbox2[3]
+                bbox2[3],
             ]
 
             # Compute the intersection of bbox1 and the aligned bbox2
@@ -108,7 +98,7 @@ def compute_bbox_intersections(S1_bboxes, S2_bboxes, sizeY):
     return intersections
 
 
-def load_bbox_data(file_path: str, image_dimensions: Tuple[int, int], is_normalized: bool) -> np.ndarray:
+def load_bbox_data(file_path: str, image_dimensions: tuple[int, int], is_normalized: bool) -> np.ndarray:
     """Load bounding box data from a file. Adjusts for image dimensions if data is normalized.
     The bounding box data is expected to be in the format [xmin, ymin, xmax, ymax].
 
@@ -121,11 +111,10 @@ def load_bbox_data(file_path: str, image_dimensions: Tuple[int, int], is_normali
         Coordinates are rounded to integers.
     """
     width, height = image_dimensions
-    
+
     n_id = 0
-    if 'view2' in file_path:
+    if "view2" in file_path:
         n_id = 1
-        
 
     try:
         data = np.loadtxt(file_path, delimiter=" ")
@@ -140,14 +129,13 @@ def load_bbox_data(file_path: str, image_dimensions: Tuple[int, int], is_normali
 
     if data.ndim == 1:  # Single bbox case, reshape to ensure it's a 2D array
         data = np.reshape(data, (-1, 5))
-        
-    data_bb=data[data[:,0]==n_id]
-    data_bb = data_bb[:,1:]
-    
-    widths = data_bb[:,2]-data_bb[:,0]
+
+    data_bb = data[data[:, 0] == n_id]
+    data_bb = data_bb[:, 1:]
+
+    widths = data_bb[:, 2] - data_bb[:, 0]
     data = data_bb[widths < 150]
-    
-    
+
     # Adjust order from [xmin, ymin, xmax, ymax] to [xmin, xmax, ymin, ymax]
     data = data[:, [0, 2, 1, 3]]
 
@@ -190,6 +178,7 @@ def calculate_intersection_over_union(bbox_a, bbox_b):
 
     return iou
 
+
 def compute_volumes(bboxes):
     """
     Compute the volume of each 3D bounding box.
@@ -198,9 +187,10 @@ def compute_volumes(bboxes):
     # Calculate dimensions from min/max coordinates
     widths = bboxes[:, 1] - bboxes[:, 0]  # xmax - xmin
     heights = bboxes[:, 3] - bboxes[:, 2]  # ymax - ymin
-    depths = bboxes[:, 5] - bboxes[:, 4]   # zmax - zmin
-    
+    depths = bboxes[:, 5] - bboxes[:, 4]  # zmax - zmin
+
     return widths * heights * depths
+
 
 def adaptive_threshold(volumes, n_bins=50, plot=False):
     """
@@ -209,41 +199,43 @@ def adaptive_threshold(volumes, n_bins=50, plot=False):
     """
     # Reshape volumes for K-means
     volumes_reshaped = volumes.reshape(-1, 1)
-    
+
     # Apply K-means clustering with 2 clusters
     kmeans = KMeans(n_clusters=2, random_state=0).fit(volumes_reshaped)
-    
+
     # Get cluster centers
     centers = kmeans.cluster_centers_.flatten()
-    
+
     # Threshold is the midpoint between the cluster centers
     threshold = (centers[0] + centers[1]) / 2
-    
+
     if plot:
         # Plot histogram
         plt.figure(figsize=(10, 6))
         hist, bin_edges = np.histogram(volumes, bins=n_bins)
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
         plt.bar(bin_centers, hist, width=(bin_edges[1] - bin_edges[0]), alpha=0.7)
-        
+
         # Highlight threshold
-        plt.axvline(x=threshold, color='r', linestyle='--', label=f'Threshold: {threshold:.2f}')
-        
+        plt.axvline(x=threshold, color="r", linestyle="--", label=f"Threshold: {threshold:.2f}")
+
         # Add labels and legend
-        plt.xlabel('Volume')
-        plt.ylabel('Frequency')
-        plt.title('Histogram of Bounding Box Volumes')
+        plt.xlabel("Volume")
+        plt.ylabel("Frequency")
+        plt.title("Histogram of Bounding Box Volumes")
         plt.legend()
         plt.grid(True, alpha=0.3)
-        plt.savefig('volume_histogram.png')
+        plt.savefig("volume_histogram.png")
         plt.show()
-    
+
     return threshold
+
 
 def filter_bboxes(bboxes, volumes, threshold):
     """Remove bounding boxes smaller than the threshold."""
     mask = volumes >= threshold
     return bboxes[mask], volumes[mask]
+
 
 def merge_2d_bboxes_into_3d(image_range: range, bbox_dir: str, image_dir: str, is_normalized: bool) -> np.ndarray:
     """Merge 2D bounding boxes from a series of images into 3D bounding boxes.
@@ -327,11 +319,11 @@ def merge_2d_bboxes_into_3d(image_range: range, bbox_dir: str, image_dir: str, i
     sufficient_span = span >= minimum_span
     filtered_3d_bboxes = combined_3d_bboxes
     print(f"Filtered 3D bounding boxes from shape {combined_3d_bboxes.shape} to {filtered_3d_bboxes.shape}.")
-    
+
     return filtered_3d_bboxes
 
 
-def process_images(view1: list, view2: list, output_file: str, is_normalized: bool = False):
+def generate_bb3d(view1: list, view2: list, output_file: str, is_normalized: bool = False):
     """Process a sequence of images and their associated bounding box files to generate 3D bounding boxes.
     The results are saved to a specified output file.
 
@@ -357,7 +349,6 @@ def process_images(view1: list, view2: list, output_file: str, is_normalized: bo
     # view2
     combined_3d_bboxes1 = merge_2d_bboxes_into_3d(image_indices1, bbox_dir1, image_dir1, is_normalized)
 
-
     # Check if any 3D bounding boxes were generated and save to the output file
     if combined_3d_bboxes is not None and combined_3d_bboxes.size > 0:
         np.save(output_file, combined_3d_bboxes)
@@ -366,21 +357,19 @@ def process_images(view1: list, view2: list, output_file: str, is_normalized: bo
     else:
         print("No 3D bounding boxes were generated.")
 
-    
     final_3d_bbox = compute_bbox_intersections(combined_3d_bboxes, combined_3d_bboxes1, end_index)
-    
-    if len(final_3d_bbox)<combined_3d_bboxes.shape[0]/2:
+
+    if len(final_3d_bbox) < combined_3d_bboxes.shape[0] / 2:
         final_3d_bbox = combined_3d_bboxes.tolist()
-        
+
     # Compute volumes
     volumes = compute_volumes(np.array(final_3d_bbox))
-    
+
     # Compute adaptive threshold
     threshold = adaptive_threshold(volumes)
-        
+
     # Filter out small bounding boxes
     filtered_bboxes, filtered_volumes = filter_bboxes(np.array(final_3d_bbox), volumes, threshold)
-        
 
     return filtered_bboxes
 
@@ -407,4 +396,4 @@ if __name__ == "__main__":
     view1 = [bbox_directory, image_directory, start_index, end_index]
     view2 = [bbox_directory1, image_directory1, start_index1, end_index1]
 
-    process_images(view1, view2, output_file_path, is_normalized=False)
+    generate_bb3d(view1, view2, output_file_path, is_normalized=False)
