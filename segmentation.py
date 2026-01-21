@@ -28,6 +28,8 @@ import torch
 from monai.inferers import sliding_window_inference
 from monai.networks.nets import BasicUNet
 
+from utils import log
+
 # =============================================================================
 # Post-processing utilities
 # =============================================================================
@@ -153,7 +155,7 @@ class SegmentationInference:
 
         self.model.load_state_dict(state_dict, strict=True)
         self.model.eval()
-        print(f"Loaded segmentation model from: {self.model_path}")
+        log(f"Loaded segmentation model from: {self.model_path}")
 
     def normalize(self, data: np.ndarray) -> np.ndarray:
         """Apply ClipZScoreNormalize preprocessing.
@@ -297,10 +299,10 @@ def segment_bboxes(
             expanded[5] - expanded[4],
         )
         if any(s < 5 for s in region_size):
-            print(f"Skipping bbox {idx}: region too small {region_size}")
+            log(f"Skipping bbox {idx}: region too small {region_size}")
             continue
 
-        print(f"Processing bbox {idx}: shape x={region_size[0]}, y={region_size[1]}, z={region_size[2]}")
+        log(f"Processing bbox {idx}: shape x={region_size[0]}, y={region_size[1]}, z={region_size[2]}")
 
         # Extract crop
         crop = volume[
@@ -362,8 +364,8 @@ def assemble_full_volume(
 
 
 if __name__ == "__main__":
-    print("3D Segmentation Inference Module")
-    print("\nUsage:")
-    print("  engine = SegmentationInference(model_path, config)")
-    print("  results = segment_bboxes(engine, volume, bboxes, save_dir)")
-    print("  full_vol = assemble_full_volume(results, volume.shape)")
+    log("3D Segmentation Inference Module")
+    log("\nUsage:")
+    log("  engine = SegmentationInference(model_path, config)")
+    log("  results = segment_bboxes(engine, volume, bboxes, save_dir)")
+    log("  full_vol = assemble_full_volume(results, volume.shape)")

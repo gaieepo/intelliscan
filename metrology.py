@@ -37,6 +37,8 @@ import nibabel as nib
 import numpy as np
 from scipy import ndimage
 
+from utils import log
+
 # ============================================================================
 # Configuration Constants
 # ============================================================================
@@ -319,7 +321,7 @@ def orient_mask_by_structure(mask_3d: np.ndarray) -> np.ndarray:
     num_pad, bbox_pad_orig = get_bounding_box(mask_3d == CLASS_COPPER_PAD)
     has_pad = num_pad > 0
 
-    print(f"Checking orientation (has_pad={has_pad})...")
+    log(f"Checking orientation (has_pad={has_pad})...")
 
     # Try all three possible orientations
     # Each transpose operation rotates a different axis to become the new y-axis (vertical)
@@ -348,20 +350,20 @@ def orient_mask_by_structure(mask_3d: np.ndarray) -> np.ndarray:
         # Check vertical alignment along y-axis (axis=1)
         is_aligned, reason = _check_vertical_alignment(bbox_pillar, bbox_solder, bbox_pad, axis=1)
 
-        print(f"  {config['name']}: {reason}")
+        log(f"  {config['name']}: {reason}")
 
         if is_aligned:
-            print(f"✓ Correct orientation found: {config['name']}")
+            log(f"✓ Correct orientation found: {config['name']}")
             if config["transpose"] is not None:
-                print(f"  Applying transpose: {config['transpose']}")
+                log(f"  Applying transpose: {config['transpose']}")
                 return np.transpose(mask_3d, config["transpose"])
             else:
-                print("  No rotation needed")
+                log("  No rotation needed")
                 return mask_3d
 
     # If no valid orientation found, issue warning and return original
-    print("⚠ Warning: No valid orientation found. Returning original mask.")
-    print("  This may indicate unusual data or segmentation errors.")
+    log("⚠ Warning: No valid orientation found. Returning original mask.")
+    log("  This may indicate unusual data or segmentation errors.")
     return mask_3d
 
 
@@ -403,11 +405,11 @@ def orient_mask_vertically(mask_3d: np.ndarray) -> np.ndarray:
 
     # If x is longest, transpose to make x → y
     if dims["x"] >= dims["z"]:
-        print("Rotating: x-axis is longest, transposing to y-axis")
+        log("Rotating: x-axis is longest, transposing to y-axis")
         return np.transpose(mask_3d, (1, 0, 2))
 
     # If z is longest, transpose to make z → y
-    print("Rotating: z-axis is longest, transposing to y-axis")
+    log("Rotating: z-axis is longest, transposing to y-axis")
     return np.transpose(mask_3d, (2, 0, 1))
 
 
@@ -495,7 +497,7 @@ def clean_segmentation_mask(mask_3d: np.ndarray) -> np.ndarray:
     Returns:
         Cleaned 3D segmentation mask
     """
-    print(f"Cleaning mask with shape: {mask_3d.shape}")
+    log(f"Cleaning mask with shape: {mask_3d.shape}")
     mask_3d = np.round(mask_3d).astype(np.uint8)
 
     # Extract and clean each class separately
@@ -504,7 +506,7 @@ def clean_segmentation_mask(mask_3d: np.ndarray) -> np.ndarray:
     mask_void = mask_3d == CLASS_VOID
     mask_pad = mask_3d == CLASS_COPPER_PAD
 
-    print(f"Copper pillar voxels: {count_nonzero_voxels(mask_pillar)}")
+    log(f"Copper pillar voxels: {count_nonzero_voxels(mask_pillar)}")
 
     # Clean non-empty masks using bounded computation
     if count_nonzero_voxels(mask_pillar) > 0:
@@ -549,11 +551,11 @@ def compute_measurements(mask_3d: np.ndarray) -> MetrologyMeasurements | None:
         or None if mask is invalid
     """
     num_classes = int(np.max(mask_3d) + 0.2)
-    print(f"Number of segmentation classes found: {num_classes}")
+    log(f"Number of segmentation classes found: {num_classes}")
 
     # Validate number of classes
     if num_classes < 2 or num_classes > 4:
-        print(f"Invalid number of classes: {num_classes}. Expected 2-4.")
+        log(f"Invalid number of classes: {num_classes}. Expected 2-4.")
         return None
 
     # Determine if this is a memory die (has copper pad class)
@@ -564,7 +566,7 @@ def compute_measurements(mask_3d: np.ndarray) -> MetrologyMeasurements | None:
     num_solder, bbox_solder = get_bounding_box(mask_3d == CLASS_SOLDER)
 
     if num_pillar <= 0 or num_solder <= 0:
-        print("Error: Missing required classes (pillar or solder)")
+        log("Error: Missing required classes (pillar or solder)")
         return None
 
     # Initialize measurements
@@ -578,13 +580,13 @@ def compute_measurements(mask_3d: np.ndarray) -> MetrologyMeasurements | None:
         if num_void > 0:
             void_solder_ratio = num_void / num_solder
             if void_solder_ratio > 0.50:
-                print(f"Warning: High void ratio detected - void: {num_void}, solder: {num_solder}")
+                log(f"Warning: High void ratio detected - void: {num_void}, solder: {num_solder}")
 
     # Memory die specific measurements
     if is_memory:
         num_pad, bbox_pad = get_bounding_box(mask_3d == CLASS_COPPER_PAD)
         if num_pad <= 0:
-            print("Warning: Memory die detected but no copper pad found")
+            log("Warning: Memory die detected but no copper pad found")
             return None
 
         # Bond line thickness: distance from pillar bottom to pad top
@@ -621,7 +623,7 @@ def compute_measurements(mask_3d: np.ndarray) -> MetrologyMeasurements | None:
 
     if void_solder_ratio > VOID_RATIO_THRESHOLD:
         defects.void_ratio_defect = True
-        print(f"Defect detected: Void ratio {void_solder_ratio:.2%} exceeds threshold {VOID_RATIO_THRESHOLD:.2%}")
+        log(f"Defect detected: Void ratio {void_solder_ratio:.2%} exceeds threshold {VOID_RATIO_THRESHOLD:.2%}")
 
     max_extrusion = max(
         abs(solder_extrusion_left),
@@ -631,11 +633,11 @@ def compute_measurements(mask_3d: np.ndarray) -> MetrologyMeasurements | None:
     )
     if max_extrusion > (SOLDER_EXTRUSION_THRESHOLD * pillar_width):
         defects.solder_extrusion_defect = True
-        print(f"Defect detected: Solder extrusion {max_extrusion:.1f}px exceeds threshold")
+        log(f"Defect detected: Solder extrusion {max_extrusion:.1f}px exceeds threshold")
 
     if is_memory and pad_misalignment > (PAD_MISALIGNMENT_THRESHOLD * pillar_width):
         defects.pad_misalignment_defect = True
-        print(f"Defect detected: Pad misalignment {pad_misalignment:.1f}px exceeds threshold")
+        log(f"Defect detected: Pad misalignment {pad_misalignment:.1f}px exceeds threshold")
 
     return MetrologyMeasurements(
         is_memory=is_memory,
@@ -675,7 +677,7 @@ def save_nifti(data: np.ndarray, save_path: str, pixel_size: float = PIXEL_SIZE_
     nifti_image = nib.Nifti1Image(data, affine=None)
     output_file = save_path if save_path.endswith(".nii.gz") else f"{save_path}.nii.gz"
     nib.save(nifti_image, output_file)
-    print(f"Saved cleaned mask to: {output_file}")
+    log(f"Saved cleaned mask to: {output_file}")
 
 
 # ============================================================================
@@ -722,9 +724,9 @@ def compute_metrology_info(
         FileNotFoundError: If nii_file doesn't exist
         ValueError: If mask is invalid or measurements cannot be computed
     """
-    print("\n" + "=" * 60)
-    print(f"Processing: {nii_file}")
-    print("=" * 60)
+    log("\n" + "=" * 60)
+    log(f"Processing: {nii_file}")
+    log("=" * 60)
 
     # Load NIfTI file
     if not os.path.exists(nii_file):
@@ -735,22 +737,22 @@ def compute_metrology_info(
 
     # Clean mask if requested
     if clean_mask:
-        print("Applying morphological cleaning...")
+        log("Applying morphological cleaning...")
         mask_3d = clean_segmentation_mask(mask_3d)
 
         if output_path:
             save_nifti(mask_3d.astype(np.uint8), output_path, pixel_size_um)
 
     # Orient mask vertically (pillar along y-axis) using structural relationships
-    print("Orienting mask...")
+    log("Orienting mask...")
     try:
         mask_3d = orient_mask_by_structure(mask_3d)
     except ValueError as e:
-        print(f"Warning: {e}. Falling back to legacy orientation method.")
+        log(f"Warning: {e}. Falling back to legacy orientation method.")
         mask_3d = orient_mask_vertically(mask_3d)
 
     # Compute measurements
-    print("Computing metrology measurements...")
+    log("Computing metrology measurements...")
     measurements = compute_measurements(mask_3d)
 
     if measurements is None:
@@ -759,16 +761,16 @@ def compute_metrology_info(
     # Convert to dictionary with physical units
     result = measurements.to_dict(pixel_size_um, num_decimals)
 
-    print("\nMeasurement Summary:")
-    print(f"  Type: {'Memory Die' if result['is_memory'] else 'Logic Die'}")
-    print(f"  BLT: {result['blt']:.{num_decimals}f} µm")
-    print(f"  Void Ratio: {result['void_solder_ratio']:.{num_decimals}%}")
-    print(f"  Pillar: {result['pillar_width']:.{num_decimals}f} × {result['pillar_height']:.{num_decimals}f} µm")
+    log("\nMeasurement Summary:")
+    log(f"  Type: {'Memory Die' if result['is_memory'] else 'Logic Die'}")
+    log(f"  BLT: {result['blt']:.{num_decimals}f} µm")
+    log(f"  Void Ratio: {result['void_solder_ratio']:.{num_decimals}%}")
+    log(f"  Pillar: {result['pillar_width']:.{num_decimals}f} × {result['pillar_height']:.{num_decimals}f} µm")
     num_defects = sum(
         [result["void_ratio_defect"], result["solder_extrusion_defect"], result["pad_misalignment_defect"]]
     )
-    print(f"  Defects: {num_defects} detected")
-    print("=" * 60 + "\n")
+    log(f"  Defects: {num_defects} detected")
+    log("=" * 60 + "\n")
 
     return result
 
@@ -821,8 +823,8 @@ def compute_metrology_from_array(
 if __name__ == "__main__":
     import tempfile
 
-    print("3D Metrology Post-Processing Module v2.0")
-    print("Testing with test.nii.gz...")
+    log("3D Metrology Post-Processing Module v2.0")
+    log("Testing with test.nii.gz...")
 
     with tempfile.TemporaryDirectory(prefix="intelliscan-metrology-") as temp_dir:
         try:
@@ -832,16 +834,16 @@ if __name__ == "__main__":
                 clean_mask=True,
             )
 
-            print("\nDetailed Results:")
-            print("-" * 60)
+            log("\nDetailed Results:")
+            log("-" * 60)
             for key, value in measurements.items():
-                print(f"{key:30s}: {value}")
-            print("-" * 60)
+                log(f"{key:30s}: {value}")
+            log("-" * 60)
 
         except FileNotFoundError:
-            print("Error: test.nii.gz not found. Please provide a test file.")
+            log("Error: test.nii.gz not found. Please provide a test file.")
         except Exception as e:
-            print(f"Error during processing: {e}")
+            log(f"Error during processing: {e}")
             import traceback
 
             traceback.print_exc()

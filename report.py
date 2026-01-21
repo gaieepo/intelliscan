@@ -33,6 +33,8 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from PyPDF2 import PdfReader, PdfWriter
 from sentence_transformers import SentenceTransformer
 
+from utils import log
+
 # A4 size in inches
 A4_WIDTH = 8.27
 A4_HEIGHT = 11.69
@@ -219,7 +221,7 @@ def generate_ai_analysis(csv_path, api_key=None, save_txt=True):
             f.write(f"# Source: {csv_path}\n")
             f.write("-" * 60 + "\n\n")
             f.write(analysis)
-        print(f"AI analysis saved to: {txt_path}")
+        log(f"AI analysis saved to: {txt_path}")
 
     return analysis
 
@@ -738,11 +740,9 @@ def generate_pdf_report(
     fold = os.path.dirname(csv_path)
 
     # add pages created by Matplotlib
-    print(fold)
+    log(f"Merging PDF from {fold}", level="debug")
     for page in PdfReader(output_path).pages:
         writer.add_page(page)
-
-    print("read")
 
     # append an external PDF (single-page or multi-page)
     # gen_report = os.path.join(fold, "gen_report.pdf")

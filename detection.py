@@ -27,6 +27,8 @@ from pathlib import Path
 import numpy as np
 from ultralytics import YOLO
 
+from utils import log
+
 
 def run_yolo_detection_inmemory(
     model_path: str,
@@ -67,11 +69,11 @@ def run_yolo_detection_inmemory(
         raise FileNotFoundError(f"Input folder not found: {input_folder}")
 
     # Load YOLO model
-    print(f"Loading YOLO model from: {model_path}")
+    log(f"Loading YOLO model from: {model_path}")
     model = YOLO(model_path)
 
     # Run batch prediction
-    print(f"Running detection on images in: {input_folder}")
+    log(f"Running detection on images in: {input_folder}")
     results = model.predict(source=input_folder, batch=batch_size, verbose=True)
 
     if len(results) == 0:
@@ -98,7 +100,7 @@ def run_yolo_detection_inmemory(
         detection_data = np.column_stack((class_ids.reshape(-1, 1), bboxes)).astype(np.float32)
         detections[filename] = detection_data
 
-    print(f"Processed {len(results)} images with {num_detections_total} total detections")
+    log(f"Processed {len(results)} images with {num_detections_total} total detections")
     return detections
 
 
@@ -145,14 +147,14 @@ def run_yolo_detection(
 
     # Create output folder
     os.makedirs(output_folder, exist_ok=True)
-    print(f"Detection output folder: {output_folder}")
+    log(f"Detection output folder: {output_folder}")
 
     # Load YOLO model
-    print(f"Loading YOLO model from: {model_path}")
+    log(f"Loading YOLO model from: {model_path}")
     model = YOLO(model_path)
 
     # Run batch prediction
-    print(f"Running detection on images in: {input_folder}")
+    log(f"Running detection on images in: {input_folder}")
     results = model.predict(source=input_folder, batch=batch_size, verbose=True)
 
     if len(results) == 0:
@@ -180,8 +182,8 @@ def run_yolo_detection(
         detection_data = np.column_stack((class_ids.reshape(-1, 1), bboxes))
         np.savetxt(output_path, detection_data, fmt="%d %.2f %.2f %.2f %.2f")
 
-    print(f"✓ Processed {len(results)} images with {num_detections_total} total detections")
-    print(f"  Detection files saved to: {output_folder}")
+    log(f"✓ Processed {len(results)} images with {num_detections_total} total detections")
+    log(f"  Detection files saved to: {output_folder}")
 
 
 # ============================================================================
@@ -222,14 +224,14 @@ def detect_from_views(
     view1_output = os.path.join(output_base_folder, "view1", "detections")
     view2_output = os.path.join(output_base_folder, "view2", "detections")
 
-    print("\n" + "=" * 60)
-    print("Running Object Detection - View 1 (Horizontal)")
-    print("=" * 60)
+    log("\n" + "=" * 60)
+    log("Running Object Detection - View 1 (Horizontal)")
+    log("=" * 60)
     run_yolo_detection(model_path, view1_folder, view1_output, batch_size)
 
-    print("\n" + "=" * 60)
-    print("Running Object Detection - View 2 (Vertical)")
-    print("=" * 60)
+    log("\n" + "=" * 60)
+    log("Running Object Detection - View 2 (Vertical)")
+    log("=" * 60)
     run_yolo_detection(model_path, view2_folder, view2_output, batch_size)
 
     return view1_output, view2_output
@@ -241,13 +243,13 @@ def detect_from_views(
 if __name__ == "__main__":
     import sys
 
-    print("2D Object Detection Module v2.0")
-    print("=" * 60)
+    log("2D Object Detection Module v2.0")
+    log("=" * 60)
 
     if len(sys.argv) < 4:
-        print("Usage: python infer_batch_new.py <model_path> <input_folder> <output_folder>")
-        print("\nExample:")
-        print("  python infer_batch_new.py models/detector.pt data/view1/images output/detections")
+        log("Usage: python infer_batch_new.py <model_path> <input_folder> <output_folder>")
+        log("\nExample:")
+        log("  python infer_batch_new.py models/detector.pt data/view1/images output/detections")
         sys.exit(1)
 
     model_path = sys.argv[1]
@@ -256,9 +258,9 @@ if __name__ == "__main__":
 
     try:
         run_yolo_detection(model_path, input_folder, output_folder)
-        print("\n✓ Detection completed successfully!")
+        log("\n✓ Detection completed successfully!")
     except Exception as e:
-        print(f"\n✗ Error: {e}")
+        log(f"\n✗ Error: {e}")
         import traceback
 
         traceback.print_exc()

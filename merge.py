@@ -23,6 +23,8 @@ import numpy as np
 from skimage.io import imread
 from sklearn.cluster import KMeans
 
+from utils import log
+
 
 # Function to compute the intersection of two 3D bounding boxes
 def intersect_bbox(bbox1, bbox2):
@@ -121,10 +123,10 @@ def load_bbox_data(file_path: str, image_dimensions: tuple[int, int], is_normali
         if data.size == 0:  # Check if there is no data to process
             return np.array([])  # Return an empty array if no data
     except OSError as e:
-        print(f"Error reading file {file_path}: {e}")
+        log(f"Error reading file {file_path}: {e}", level="error")
         return np.array([])
     except ValueError as e:
-        print(f"Malformed data in file {file_path}: {e}")
+        log(f"Malformed data in file {file_path}: {e}", level="warning")
         return np.array([])
 
     if data.ndim == 1:  # Single bbox case, reshape to ensure it's a 2D array
@@ -397,7 +399,7 @@ def merge_2d_bboxes_into_3d_inmemory(
                 bbox_count += 1
 
     result = combined_3d_bboxes[:bbox_count].copy()
-    print(f"Generated {bbox_count} 3D bounding boxes.")
+    log(f"Generated {bbox_count} 3D bounding boxes.")
     return result
 
 
@@ -435,10 +437,10 @@ def generate_bb3d_inmemory(
     if output_file and combined_3d_bboxes is not None and combined_3d_bboxes.size > 0:
         np.save(output_file, combined_3d_bboxes)
         np.save(output_file[:-4] + "_1.npy", combined_3d_bboxes1)
-        print(f"3D bounding boxes with shape {combined_3d_bboxes.shape} saved to {output_file}.")
+        log(f"3D bounding boxes with shape {combined_3d_bboxes.shape} saved to {output_file}.", level="debug")
 
     if combined_3d_bboxes.size == 0:
-        print("No 3D bounding boxes were generated.")
+        log("No 3D bounding boxes were generated.", level="warning")
         return np.empty((0, 6))
 
     final_3d_bbox = compute_bbox_intersections(combined_3d_bboxes, combined_3d_bboxes1, view1_num_slices)
@@ -487,7 +489,7 @@ def merge_2d_bboxes_into_3d(image_range: range, bbox_dir: str, image_dir: str, i
             break
 
     if cached_dims is None:
-        print("No images found in range. Returning empty array.")
+        log("No images found in range. Returning empty array.", level="warning")
         return np.empty((0, 6))
 
     width, height = cached_dims
@@ -551,7 +553,7 @@ def merge_2d_bboxes_into_3d(image_range: range, bbox_dir: str, image_dir: str, i
 
     # Trim to actual size
     result = combined_3d_bboxes[:bbox_count].copy()
-    print(f"Generated {bbox_count} 3D bounding boxes.")
+    log(f"Generated {bbox_count} 3D bounding boxes.")
 
     return result
 
@@ -586,9 +588,9 @@ def generate_bb3d(view1: list, view2: list, output_file: str, is_normalized: boo
     if combined_3d_bboxes is not None and combined_3d_bboxes.size > 0:
         np.save(output_file, combined_3d_bboxes)
         np.save(output_file[:-4] + "_1.npy", combined_3d_bboxes1)
-        print(f"3D bounding boxes with shape {combined_3d_bboxes.shape} saved to {output_file}.")
+        log(f"3D bounding boxes with shape {combined_3d_bboxes.shape} saved to {output_file}.", level="debug")
     else:
-        print("No 3D bounding boxes were generated.")
+        log("No 3D bounding boxes were generated.", level="warning")
 
     final_3d_bbox = compute_bbox_intersections(combined_3d_bboxes, combined_3d_bboxes1, end_index)
 

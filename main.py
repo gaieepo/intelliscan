@@ -14,9 +14,25 @@ Pipeline Workflow:
 4. Perform 3D semantic segmentation within bounding boxes
 5. Compute metrology measurements (BLT, void ratio, defects)
 6. Generate PDF reports with analysis
+
+Usage:
+    # Process files from files.txt (batch mode)
+    python main.py
+
+    # Process a single file
+    python main.py /path/to/input.nii
+
+    # Force reprocessing
+    python main.py /path/to/input.nii --force
+
+    # Use as module
+    from main import process_single_file
+    result = process_single_file("/path/to/input.nii", force=False)
 """
 
+import argparse
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
 import nibabel as nib
@@ -34,12 +50,24 @@ from segmentation import (
     expand_bbox,
     segment_bboxes,
 )
-from utils import PipelineLogger, PipelineMetrics, create_folder_structure, log, nii2jpg
+from utils import PipelineLogbook, PipelineLogger, PipelineMetrics, create_folder_structure, log, nii2jpg
 
-# Pipeline configuration flags
-USE_COMBINED_SEG_METROLOGY = True  # Combines segmentation and metrology into single phase
-USE_INMEMORY_DETECTION = True  # Use in-memory detection/merge (faster, no intermediate TXT files)
-VERBOSE = True  # Print detailed logs to console (always writes to log file)
+
+@dataclass
+class PipelineConfig:
+    """Pipeline configuration settings."""
+
+    output_base: str = "output"
+    detection_model: str = "models/detection_model.pt"
+    segmentation_model: str = "models/segmentation_model.ckpt"
+    use_combined_seg_metrology: bool = True
+    use_inmemory_detection: bool = False
+    verbose: bool = True
+    clean_mask: bool = MAKE_CLEAN_DEFAULT
+
+
+# Default configuration
+DEFAULT_CONFIG = PipelineConfig()
 
 
 def process_segmentation_and_metrology_combined(
@@ -109,10 +137,10 @@ def process_segmentation_and_metrology_combined(
             expanded[5] - expanded[4],
         )
         if any(s < 5 for s in region_size):
-            print(f"Skipping bbox {idx}: region too small {region_size}")
+            log(f"Skipping bbox {idx}: region too small {region_size}", level="warning")
             continue
 
-        print(f"Processing bbox {idx}: shape x={region_size[0]}, y={region_size[1]}, z={region_size[2]}")
+        log(f"Processing bbox {idx}: shape x={region_size[0]}, y={region_size[1]}, z={region_size[2]}", level="debug")
 
         # Extract crop
         crop = volume[
@@ -154,7 +182,7 @@ def process_segmentation_and_metrology_combined(
             metrology_df = pd.concat([metrology_df, pd.DataFrame([record])], ignore_index=True)
 
         except Exception as e:
-            print(f"Error computing metrology for bbox {idx}: {e}")
+            log(f"Error computing metrology for bbox {idx}: {e}", level="error")
 
         # Save crop and prediction to disk (for debugging/compatibility)
         img_path = seg_output_dir / "img" / f"img_{idx}.nii.gz"
@@ -207,7 +235,7 @@ def process_metrology(
     """
     segmented_files = sorted(input_folder.rglob("*.nii.gz"))
     num_files = len(segmented_files)
-    print(f"Number of segmented files to process: {num_files}")
+    log(f"Number of segmented files to process: {num_files}")
 
     # Create output folders if they don't exist
     output_folder.mkdir(parents=True, exist_ok=True)
@@ -233,7 +261,7 @@ def process_metrology(
     metrology_df = pd.DataFrame(columns=columns)
 
     for i, segmented_file in enumerate(segmented_files):
-        print(f"Processing file {i + 1}/{num_files}: {segmented_file}")
+        log(f"Processing file {i + 1}/{num_files}: {segmented_file}", level="debug")
         rel_path = segmented_file.relative_to(input_folder)
         output_path = clean_out_path / rel_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -270,9 +298,8 @@ def process_metrology(
             metrology_df = pd.concat([metrology_df, pd.DataFrame([record])], ignore_index=True)
 
         except Exception as e:
-            print(f"Error processing file {segmented_file}")
-            print(f"Error details: {str(e)}")
-            print("Stack trace:", traceback.format_exc())
+            log(f"Error processing file {segmented_file}: {e}", level="error")
+            log(f"Stack trace: {traceback.format_exc()}", level="debug")
             continue
 
     # Save DataFrame to CSV
@@ -281,257 +308,380 @@ def process_metrology(
     return metrology_df
 
 
-def main():
-    # Read input files from files.txt
-    with open("files.txt") as f:
-        input_files = [line.strip() for line in f.readlines()]
+def process_single_file(
+    input_file: str | Path,
+    config: PipelineConfig | None = None,
+    force: bool = False,
+) -> dict:
+    """Process a single input file through the pipeline.
 
-    log(f"Found {len(input_files)} files to process")
+    This is the main entry point for processing a single file. It can be called
+    directly as a module or via CLI.
 
-    # Each line in files.txt is a task
-    for inputfile in input_files:
-        log(f"Processing file: {inputfile}")
+    Args:
+        input_file: Path to input NIfTI file
+        config: Pipeline configuration (uses DEFAULT_CONFIG if None)
+        force: Force reprocessing even if already completed
 
-        # Original path
-        p = Path(inputfile)
+    Returns:
+        Dictionary with processing result:
+            - status: "completed", "skipped", or "failed"
+            - output_dir: Path to output directory
+            - reason: Reason for status (if skipped or failed)
+            - metrics: Processing metrics (if completed)
+    """
+    config = config or DEFAULT_CONFIG
+    input_file = Path(input_file)
 
-        # Remove the extension and build output folder path
-        p_no_ext = p.with_suffix("")  # yields folder1/folder2/filename
-        input_base_name = Path(*p_no_ext.parts[-2:])  # yields folder2/filename
-        outfolder = Path("output") / input_base_name
-        outfolder.mkdir(parents=True, exist_ok=True)
+    # Initialize logbook for job tracking
+    logbook = PipelineLogbook(config.output_base)
 
-        # Single detection model for both views
-        detection_model = "models/detection_model.pt"
-        segmentation_model = "models/segmentation_model.ckpt"
+    # Check if should process
+    should_run, reason = logbook.should_process(input_file, force=force)
+    if not should_run:
+        return {"status": "skipped", "input_file": str(input_file), "reason": reason}
 
-        views = ["view1", "view2"]
+    # Get output directory using sample ID extraction
+    outfolder = logbook.get_output_dir(input_file)
+    outfolder.mkdir(parents=True, exist_ok=True)
 
-        # Initialize logger and metrics for this task
-        logger = PipelineLogger(log_file=outfolder / "execution.log", verbose=VERBOSE)
-        metrics = PipelineMetrics(task_id=inputfile)
+    # Mark job as started
+    logbook.mark_started(
+        input_file,
+        outfolder,
+        config={
+            "use_combined_seg_metrology": config.use_combined_seg_metrology,
+            "use_inmemory_detection": config.use_inmemory_detection,
+            "clean_mask": config.clean_mask,
+        },
+    )
 
-        try:
-            with metrics.phase("Folder Creation"):
-                folder_structure = create_folder_structure(str(outfolder), views)
+    views = ["view1", "view2"]
 
-            # Load volume data once for reuse across pipeline stages
-            log(f"Loading volume: {inputfile}")
-            img = nib.load(inputfile)
-            data3d = img.get_fdata()
-            if data3d.ndim == 4:
-                data3d = data3d[..., 3]
-            data_max = data3d.max()
+    # Initialize logger and metrics for this task
+    logger = PipelineLogger(log_file=outfolder / "execution.log", verbose=config.verbose)
+    metrics = PipelineMetrics(task_id=str(input_file))
 
-            with metrics.phase("NII to JPG Conversion") as phase:
-                log("Converting NII to JPG...")
-                view1_slices = nii2jpg(data3d, folder_structure["view1"]["input_images"], 0, data_max)
-                view2_slices = nii2jpg(data3d, folder_structure["view2"]["input_images"], 1, data_max)
-                num_slices = view1_slices + view2_slices
-                phase.complete(count=num_slices)
+    try:
+        with metrics.phase("Folder Creation"):
+            folder_structure = create_folder_structure(str(outfolder), views)
 
-            if USE_INMEMORY_DETECTION:
-                # In-memory detection pipeline (faster, no intermediate files)
-                with metrics.phase("2D Detection Inference") as phase:
-                    log("Running object detection inference (in-memory)...")
+        # Load volume data once for reuse across pipeline stages
+        log(f"Loading volume: {input_file}")
+        img = nib.load(input_file)
+        data3d = img.get_fdata()
+        if data3d.ndim == 4:
+            data3d = data3d[..., 3]
+        data_max = data3d.max()
 
-                    log("Running detection on view1...")
-                    view1_detections = run_yolo_detection_inmemory(
-                        model_path=detection_model,
-                        input_folder=folder_structure["view1"]["input_images"],
-                    )
+        with metrics.phase("NII to JPG Conversion") as phase:
+            log("Converting NII to JPG...")
+            view1_slices = nii2jpg(data3d, folder_structure["view1"]["input_images"], 0, data_max)
+            view2_slices = nii2jpg(data3d, folder_structure["view2"]["input_images"], 1, data_max)
+            num_slices = view1_slices + view2_slices
+            phase.complete(count=num_slices)
 
-                    log("Running detection on view2...")
-                    view2_detections = run_yolo_detection_inmemory(
-                        model_path=detection_model,
-                        input_folder=folder_structure["view2"]["input_images"],
-                    )
+        if config.use_inmemory_detection:
+            # In-memory detection pipeline (faster, no intermediate files)
+            with metrics.phase("2D Detection Inference") as phase:
+                log("Running object detection inference (in-memory)...")
 
-                    num_slices = len(view1_detections) + len(view2_detections)
-                    phase.complete(count=num_slices)
-
-                with metrics.phase("3D Bounding Box Generation") as phase:
-                    log("Generating 3D bounding boxes (in-memory)...")
-
-                    # Get image dimensions from first image
-                    from PIL import Image
-
-                    sample_image_path = Path(folder_structure["view1"]["input_images"]) / "image0.jpg"
-                    with Image.open(sample_image_path) as img:
-                        image_dimensions = img.size  # (width, height)
-
-                    view1_num_slices = len(view1_detections)
-                    view2_num_slices = len(view2_detections)
-
-                    bb_3d = generate_bb3d_inmemory(
-                        view1_detections=view1_detections,
-                        view2_detections=view2_detections,
-                        view1_num_slices=view1_num_slices,
-                        view2_num_slices=view2_num_slices,
-                        image_dimensions=image_dimensions,
-                        output_file=str(outfolder / "3d_bounding_boxes.npy"),
-                        is_normalized=False,
-                    )
-
-                    # Save as single array
-                    np.save(outfolder / "bb3d.npy", bb_3d)
-
-                    # Free detection memory after merging
-                    del view1_detections, view2_detections
-
-                    effective_slices = view1_num_slices + view2_num_slices
-                    phase.complete(count=effective_slices)
-
-                # Explicit cleanup before loading segmentation model
-                import gc
-
-                gc.collect()
-
-            else:
-                # File-based detection pipeline (original behavior)
-                with metrics.phase("2D Detection Inference") as phase:
-                    log("Running object detection inference...")
-
-                    for view in views:
-                        input_folder = folder_structure[view]["input_images"]
-                        output_folder = folder_structure[view]["detections"]
-
-                        log(f"Running detection on {view}...")
-                        run_yolo_detection(
-                            model_path=detection_model,
-                            input_folder=input_folder,
-                            output_folder=output_folder,
-                            batch_size=64,
-                        )
-
-                    view1_dir = Path(folder_structure["view1"]["input_images"])
-                    view2_dir = Path(folder_structure["view2"]["input_images"])
-                    num_slices = len(list(view1_dir.glob("*.jpg"))) + len(list(view2_dir.glob("*.jpg")))
-                    phase.complete(count=num_slices)
-
-                with metrics.phase("3D Bounding Box Generation") as phase:
-                    log("Generating 3D bounding boxes...")
-                    view1_dir = Path(folder_structure["view1"]["input_images"])
-                    view2_dir = Path(folder_structure["view2"]["input_images"])
-                    view1_num_slices = len(list(view1_dir.glob("*.jpg")))
-                    view2_num_slices = len(list(view2_dir.glob("*.jpg")))
-                    view1_params = [
-                        folder_structure["view1"]["detections"],
-                        folder_structure["view1"]["input_images"],
-                        0,
-                        view1_num_slices,
-                    ]
-                    view2_params = [
-                        folder_structure["view2"]["detections"],
-                        folder_structure["view2"]["input_images"],
-                        0,
-                        view2_num_slices,
-                    ]
-                    bb_3d = generate_bb3d(
-                        view1_params, view2_params, str(outfolder / "3d_bounding_boxes.npy"), is_normalized=False
-                    )
-                    np.save(outfolder / "bb3d.npy", bb_3d)
-                    effective_slices = view1_num_slices + view2_num_slices
-                    phase.complete(count=effective_slices)
-
-            num_bboxes = len(bb_3d) if bb_3d.ndim == 1 else bb_3d.shape[0]
-            log(f"3D bounding boxes shape: {bb_3d.shape}")
-
-            seg_output_dir = outfolder / "mmt"
-            engine = SegmentationInference(segmentation_model, SegmentationConfig())
-
-            if USE_COMBINED_SEG_METROLOGY:
-                # Combined segmentation + metrology in single phase
-                with metrics.phase("3D Segmentation + Metrology") as phase:
-                    log("Running combined 3D segmentation and metrology...")
-
-                    results, metrology_df = process_segmentation_and_metrology_combined(
-                        engine=engine,
-                        volume=data3d,
-                        bboxes=bb_3d,
-                        seg_output_dir=seg_output_dir,
-                        metrology_output_dir=outfolder / "metrology",
-                        clean_mask=MAKE_CLEAN_DEFAULT,
-                    )
-
-                    # Assemble into full volume and save
-                    full_segmentation = assemble_full_volume(results, data3d.shape)
-                    nib.save(
-                        nib.Nifti1Image(full_segmentation, np.eye(4)),
-                        str(outfolder / "segmentation.nii.gz"),
-                    )
-                    log(f"Combined segmentation + metrology completed, saved to {outfolder}")
-                    phase.complete(count=num_bboxes)
-
-            else:
-                # Separate segmentation and metrology phases (original behavior)
-                with metrics.phase("3D Segmentation") as phase:
-                    log("Running 3D segmentation...")
-
-                    # Create output directories for per-bbox results
-                    (seg_output_dir / "img").mkdir(parents=True, exist_ok=True)
-                    (seg_output_dir / "pred").mkdir(parents=True, exist_ok=True)
-
-                    # Segment all bounding boxes
-                    results = segment_bboxes(engine, data3d, bb_3d, save_dir=seg_output_dir)
-
-                    # Assemble into full volume and save
-                    full_segmentation = assemble_full_volume(results, data3d.shape)
-                    nib.save(
-                        nib.Nifti1Image(full_segmentation, np.eye(4)),
-                        str(outfolder / "segmentation.nii.gz"),
-                    )
-                    log(f"Segmentation completed, saved to {outfolder}")
-                    phase.complete(count=num_bboxes)
-
-                with metrics.phase("Metrology") as phase:
-                    metrology_input_path = outfolder / "mmt" / "pred"
-                    log(f"Checking metrology input folder: {metrology_input_path}")
-                    mask_files = []
-                    if metrology_input_path.exists():
-                        mask_files = list(metrology_input_path.rglob("*.nii.gz"))
-                        log(f"Found {len(mask_files)} .nii.gz files to process")
-                        if len(mask_files) == 0:
-                            log("No files found! Check if previous steps generated files.", level="warning")
-                    else:
-                        log(f"Metrology input folder does not exist: {metrology_input_path}", level="error")
-
-                    # Reshape to match expected format [1, N] for single model
-                    bb_3d_list = bb_3d.reshape(1, -1) if bb_3d.ndim == 1 else np.expand_dims(bb_3d, axis=0)
-
-                    metrology_df = process_metrology(
-                        input_folder=metrology_input_path,
-                        output_folder=outfolder / "metrology",
-                        clean_out_path=outfolder / "cleaned_metrology",
-                        clean_mask=MAKE_CLEAN_DEFAULT,
-                        bb_3d_list=bb_3d_list,
-                    )
-                    phase.complete(count=len(mask_files))
-
-            report_path = outfolder / "metrology" / "metrology_report.pdf"
-            with metrics.phase("Report Generation"):
-                generate_pdf_report(
-                    str(outfolder / "metrology" / "metrology.csv"),
-                    str(report_path),
-                    input_filename=p.name,
+                log("Running detection on view1...")
+                view1_detections = run_yolo_detection_inmemory(
+                    model_path=config.detection_model,
+                    input_folder=folder_structure["view1"]["input_images"],
                 )
 
-            # Save metrics for this task
-            metrics.write_log(str(outfolder / "timing.log"))
-            metrics.save(str(outfolder / "metrics.json"))
+                log("Running detection on view2...")
+                view2_detections = run_yolo_detection_inmemory(
+                    model_path=config.detection_model,
+                    input_folder=folder_structure["view2"]["input_images"],
+                )
 
-            log(f"Successfully processed {inputfile}")
-            log(f"Report generated at {report_path.parent}")
+                num_slices = len(view1_detections) + len(view2_detections)
+                phase.complete(count=num_slices)
 
-        except Exception as e:
-            log(f"Error processing {inputfile}: {str(e)}", level="error")
-            # Still save partial metrics on error
-            metrics.write_log(str(outfolder / "timing.log"))
-            metrics.save(str(outfolder / "metrics.json"))
-            continue
+            with metrics.phase("3D Bounding Box Generation") as phase:
+                log("Generating 3D bounding boxes (in-memory)...")
 
-        finally:
-            logger.close()
+                # Get image dimensions from first image
+                from PIL import Image
+
+                sample_image_path = Path(folder_structure["view1"]["input_images"]) / "image0.jpg"
+                with Image.open(sample_image_path) as pil_img:
+                    image_dimensions = pil_img.size  # (width, height)
+
+                view1_num_slices = len(view1_detections)
+                view2_num_slices = len(view2_detections)
+
+                bb_3d = generate_bb3d_inmemory(
+                    view1_detections=view1_detections,
+                    view2_detections=view2_detections,
+                    view1_num_slices=view1_num_slices,
+                    view2_num_slices=view2_num_slices,
+                    image_dimensions=image_dimensions,
+                    output_file=str(outfolder / "3d_bounding_boxes.npy"),
+                    is_normalized=False,
+                )
+
+                # Save as single array
+                np.save(outfolder / "bb3d.npy", bb_3d)
+
+                # Free detection memory after merging
+                del view1_detections, view2_detections
+
+                effective_slices = view1_num_slices + view2_num_slices
+                phase.complete(count=effective_slices)
+
+            # Explicit cleanup before loading segmentation model
+            import gc
+
+            gc.collect()
+
+        else:
+            # File-based detection pipeline (original behavior)
+            with metrics.phase("2D Detection Inference") as phase:
+                log("Running object detection inference...")
+
+                for view in views:
+                    input_folder = folder_structure[view]["input_images"]
+                    output_folder = folder_structure[view]["detections"]
+
+                    log(f"Running detection on {view}...")
+                    run_yolo_detection(
+                        model_path=config.detection_model,
+                        input_folder=input_folder,
+                        output_folder=output_folder,
+                    )
+
+                view1_dir = Path(folder_structure["view1"]["input_images"])
+                view2_dir = Path(folder_structure["view2"]["input_images"])
+                num_slices = len(list(view1_dir.glob("*.jpg"))) + len(list(view2_dir.glob("*.jpg")))
+                phase.complete(count=num_slices)
+
+            with metrics.phase("3D Bounding Box Generation") as phase:
+                log("Generating 3D bounding boxes...")
+                view1_dir = Path(folder_structure["view1"]["input_images"])
+                view2_dir = Path(folder_structure["view2"]["input_images"])
+                view1_num_slices = len(list(view1_dir.glob("*.jpg")))
+                view2_num_slices = len(list(view2_dir.glob("*.jpg")))
+                view1_params = [
+                    folder_structure["view1"]["detections"],
+                    folder_structure["view1"]["input_images"],
+                    0,
+                    view1_num_slices,
+                ]
+                view2_params = [
+                    folder_structure["view2"]["detections"],
+                    folder_structure["view2"]["input_images"],
+                    0,
+                    view2_num_slices,
+                ]
+                bb_3d = generate_bb3d(
+                    view1_params, view2_params, str(outfolder / "3d_bounding_boxes.npy"), is_normalized=False
+                )
+                np.save(outfolder / "bb3d.npy", bb_3d)
+                effective_slices = view1_num_slices + view2_num_slices
+                phase.complete(count=effective_slices)
+
+        num_bboxes = len(bb_3d) if bb_3d.ndim == 1 else bb_3d.shape[0]
+        log(f"3D bounding boxes shape: {bb_3d.shape}")
+
+        seg_output_dir = outfolder / "mmt"
+        engine = SegmentationInference(config.segmentation_model, SegmentationConfig())
+
+        if config.use_combined_seg_metrology:
+            # Combined segmentation + metrology in single phase
+            with metrics.phase("3D Segmentation + Metrology") as phase:
+                log("Running combined 3D segmentation and metrology...")
+
+                results, metrology_df = process_segmentation_and_metrology_combined(
+                    engine=engine,
+                    volume=data3d,
+                    bboxes=bb_3d,
+                    seg_output_dir=seg_output_dir,
+                    metrology_output_dir=outfolder / "metrology",
+                    clean_mask=config.clean_mask,
+                )
+
+                # Assemble into full volume and save
+                full_segmentation = assemble_full_volume(results, data3d.shape)
+                nib.save(
+                    nib.Nifti1Image(full_segmentation, np.eye(4)),
+                    str(outfolder / "segmentation.nii.gz"),
+                )
+                log(f"Combined segmentation + metrology completed, saved to {outfolder}")
+                phase.complete(count=num_bboxes)
+
+        else:
+            # Separate segmentation and metrology phases (original behavior)
+            with metrics.phase("3D Segmentation") as phase:
+                log("Running 3D segmentation...")
+
+                # Create output directories for per-bbox results
+                (seg_output_dir / "img").mkdir(parents=True, exist_ok=True)
+                (seg_output_dir / "pred").mkdir(parents=True, exist_ok=True)
+
+                # Segment all bounding boxes
+                results = segment_bboxes(engine, data3d, bb_3d, save_dir=seg_output_dir)
+
+                # Assemble into full volume and save
+                full_segmentation = assemble_full_volume(results, data3d.shape)
+                nib.save(
+                    nib.Nifti1Image(full_segmentation, np.eye(4)),
+                    str(outfolder / "segmentation.nii.gz"),
+                )
+                log(f"Segmentation completed, saved to {outfolder}")
+                phase.complete(count=num_bboxes)
+
+            with metrics.phase("Metrology") as phase:
+                metrology_input_path = outfolder / "mmt" / "pred"
+                log(f"Checking metrology input folder: {metrology_input_path}")
+                mask_files = []
+                if metrology_input_path.exists():
+                    mask_files = list(metrology_input_path.rglob("*.nii.gz"))
+                    log(f"Found {len(mask_files)} .nii.gz files to process")
+                    if len(mask_files) == 0:
+                        log("No files found! Check if previous steps generated files.", level="warning")
+                else:
+                    log(f"Metrology input folder does not exist: {metrology_input_path}", level="error")
+
+                # Reshape to match expected format [1, N] for single model
+                bb_3d_list = bb_3d.reshape(1, -1) if bb_3d.ndim == 1 else np.expand_dims(bb_3d, axis=0)
+
+                _ = process_metrology(
+                    input_folder=metrology_input_path,
+                    output_folder=outfolder / "metrology",
+                    clean_out_path=outfolder / "cleaned_metrology",
+                    clean_mask=config.clean_mask,
+                    bb_3d_list=bb_3d_list,
+                )
+                phase.complete(count=len(mask_files))
+
+        report_path = outfolder / "metrology" / "metrology_report.pdf"
+        with metrics.phase("Report Generation"):
+            generate_pdf_report(
+                str(outfolder / "metrology" / "metrology.csv"),
+                str(report_path),
+                input_filename=input_file.name,
+            )
+
+        # Save metrics for this task
+        metrics.write_log(str(outfolder / "timing.log"))
+        metrics.save(str(outfolder / "metrics.json"))
+
+        log(f"Successfully processed {input_file}")
+        log(f"Report generated at {report_path.parent}")
+
+        # Mark job as completed
+        logbook.mark_completed(input_file, metrics.summary())
+
+        return {
+            "status": "completed",
+            "input_file": str(input_file),
+            "output_dir": str(outfolder),
+            "metrics": metrics.summary(),
+        }
+
+    except Exception as e:
+        error_msg = f"{e}\n{traceback.format_exc()}"
+        log(f"Error processing {input_file}: {e}", level="error")
+
+        # Still save partial metrics on error
+        metrics.write_log(str(outfolder / "timing.log"))
+        metrics.save(str(outfolder / "metrics.json"))
+
+        # Mark job as failed
+        logbook.mark_failed(input_file, str(e))
+
+        return {
+            "status": "failed",
+            "input_file": str(input_file),
+            "output_dir": str(outfolder),
+            "error": error_msg,
+        }
+
+    finally:
+        logger.close()
+
+
+def main():
+    """Main entry point for CLI usage."""
+    parser = argparse.ArgumentParser(
+        description="3D-IntelliScan Pipeline: Detection, Segmentation, and Metrology",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py                          # Process all files in files.txt
+  python main.py /path/to/input.nii       # Process single file
+  python main.py /path/to/input.nii --force  # Force reprocessing
+  python main.py --list                   # List all jobs in logbook
+        """,
+    )
+    parser.add_argument("input_file", nargs="?", help="Input NIfTI file to process")
+    parser.add_argument("--force", "-f", action="store_true", help="Force reprocessing")
+    parser.add_argument("--output", "-o", default="output", help="Output base directory")
+    parser.add_argument("--verbose", "-v", action="store_true", default=True, help="Verbose output")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Quiet mode (only essential output)")
+    parser.add_argument("--list", action="store_true", help="List all jobs in logbook")
+    parser.add_argument("--inmemory", action="store_true", help="Use in-memory detection (faster)")
+
+    args = parser.parse_args()
+
+    # Create config from args
+    config = PipelineConfig(
+        output_base=args.output,
+        verbose=not args.quiet,
+        use_inmemory_detection=args.inmemory,
+    )
+
+    # List jobs mode
+    if args.list:
+        logbook = PipelineLogbook(config.output_base)
+        jobs = logbook.list_jobs()
+        if not jobs:
+            print("No jobs in logbook")
+        else:
+            print(f"{'Status':<12} {'Sample':<12} {'Started':<20} {'Input File'}")
+            print("-" * 80)
+            for job in jobs:
+                sample_id = PipelineLogbook.extract_sample_id(job.get("input_path", ""))
+                status = job.get("status", "unknown")
+                started = job.get("started_at", "")
+                input_path = job.get("input_path", "")
+                print(f"{status:<12} {sample_id:<12} {started:<20} {input_path}")
+        return
+
+    # Determine input files
+    if args.input_file:
+        # Single file mode
+        input_files = [args.input_file]
+    else:
+        # Batch mode from files.txt
+        try:
+            with open("files.txt") as f:
+                input_files = [line.strip() for line in f.readlines() if line.strip()]
+        except FileNotFoundError:
+            print("Error: No input file specified and files.txt not found")
+            print("Usage: python main.py <input_file> or create files.txt")
+            return
+
+    print(f"Found {len(input_files)} file(s) to process")
+
+    # Process each file
+    for input_file in input_files:
+        print(f"\n{'=' * 60}")
+        print(f"Processing: {input_file}")
+        print(f"{'=' * 60}")
+
+        result = process_single_file(input_file, config=config, force=args.force)
+
+        if result["status"] == "skipped":
+            print(f"Skipped: {result['reason']}")
+        elif result["status"] == "completed":
+            print(f"Completed: output at {result['output_dir']}")
+        else:
+            print(f"Failed: {result.get('error', 'Unknown error')}")
 
 
 if __name__ == "__main__":
