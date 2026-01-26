@@ -60,7 +60,7 @@ class PipelineConfig:
     output_base: str = "output"
     detection_model: str = "models/detection_model.pt"
     segmentation_model: str = "models/segmentation_model.ckpt"
-    use_combined_seg_metrology: bool = True
+    use_combined_seg_metrology: bool = False
     use_inmemory_detection: bool = False
     verbose: bool = True
     clean_mask: bool = MAKE_CLEAN_DEFAULT
