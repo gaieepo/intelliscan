@@ -8,10 +8,12 @@
 # Models directory - ignore trained model weights
 *.pth
 *.pt
+*.ckpt
 *.onnx
 *.h5
 *.pb
 *.tflite
+*.engine
 
 # Output directory - ignore processing results
 output/
