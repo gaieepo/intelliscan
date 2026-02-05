@@ -516,8 +516,10 @@ def process_single_file(
             with metrics.phase("3D Segmentation") as phase:
                 log("Running 3D segmentation...")
 
-                # Segment all bounding boxes (no intermediate nii.gz saving)
-                results = segment_bboxes(engine, data3d, bb_3d, save_dir=None)
+                # Segment all bounding boxes (save nii.gz for metrology + report)
+                (seg_output_dir / "img").mkdir(parents=True, exist_ok=True)
+                (seg_output_dir / "pred").mkdir(parents=True, exist_ok=True)
+                results = segment_bboxes(engine, data3d, bb_3d, save_dir=seg_output_dir)
 
                 # Assemble into full volume and save
                 full_segmentation = assemble_full_volume(results, data3d.shape)
@@ -529,73 +531,15 @@ def process_single_file(
                 phase.complete(count=num_bboxes)
 
             with metrics.phase("Metrology") as phase:
-                log("Computing metrology from in-memory predictions...")
-                metrology_output_dir = outfolder / "metrology"
-                metrology_output_dir.mkdir(parents=True, exist_ok=True)
-
-                columns = [
-                    "filename", "is_memory",
-                    "void_ratio_defect", "solder_extrusion_defect",
-                    "pad_misalignment_defect", "bb", "BLT",
-                    "Pad_misalignment", "Void_to_solder_ratio",
-                    "solder_extrusion_copper_pillar",
-                    "pillar_width", "pillar_height",
-                ]
-                metrology_df = pd.DataFrame(columns=columns)
-
-                for result in results:
-                    try:
-                        measurements = compute_metrology_from_array(
-                            result.prediction.copy(),
-                            clean_mask=config.clean_mask,
-                        )
-                        bbox = result.original_bbox
-                        record = {
-                            "filename": f"pred_{result.bbox_index}.nii.gz",
-                            "is_memory": measurements["is_memory"],
-                            "void_ratio_defect": measurements["void_ratio_defect"],
-                            "solder_extrusion_defect": measurements["solder_extrusion_defect"],
-                            "pad_misalignment_defect": measurements["pad_misalignment_defect"],
-                            "bb": bbox.tolist() if hasattr(bbox, "tolist") else list(bbox),
-                            "BLT": measurements["blt"],
-                            "Pad_misalignment": measurements["pad_misalignment"],
-                            "Void_to_solder_ratio": measurements["void_solder_ratio"],
-                            "solder_extrusion_copper_pillar": [
-                                measurements["solder_extrusion_left"],
-                                measurements["solder_extrusion_right"],
-                                measurements["solder_extrusion_front"],
-                                measurements["solder_extrusion_back"],
-                            ],
-                            "pillar_width": measurements["pillar_width"],
-                            "pillar_height": measurements["pillar_height"],
-                        }
-                        metrology_df = pd.concat(
-                            [metrology_df, pd.DataFrame([record])], ignore_index=True
-                        )
-                    except Exception as e:
-                        log(f"Error computing metrology for bbox {result.bbox_index}: {e}", level="error")
-
-                metrology_df.to_csv(metrology_output_dir / "metrology.csv", index=False)
+                log("Computing metrology measurements...")
+                metrology_df = process_metrology(
+                    input_folder=seg_output_dir / "pred",
+                    output_folder=outfolder / "metrology",
+                    clean_out_path=outfolder / "metrology" / "clean",
+                    clean_mask=config.clean_mask,
+                    bb_3d_list=bb_3d[np.newaxis, :] if bb_3d.ndim == 2 else bb_3d,
+                )
                 phase.complete(count=len(results))
-
-            # Save per-bbox nii.gz for report visualization (outside seg timing)
-            (seg_output_dir / "img").mkdir(parents=True, exist_ok=True)
-            (seg_output_dir / "pred").mkdir(parents=True, exist_ok=True)
-            for result in results:
-                idx = result.bbox_index
-                crop = data3d[
-                    result.expanded_bbox[0] : result.expanded_bbox[1],
-                    result.expanded_bbox[2] : result.expanded_bbox[3],
-                    result.expanded_bbox[4] : result.expanded_bbox[5],
-                ]
-                nib.save(
-                    nib.Nifti1Image(crop.astype(np.float32), np.eye(4)),
-                    str(seg_output_dir / "img" / f"img_{idx}.nii.gz"),
-                )
-                nib.save(
-                    nib.Nifti1Image(result.prediction.astype(np.float32), np.eye(4)),
-                    str(seg_output_dir / "pred" / f"pred_{idx}.nii.gz"),
-                )
 
         report_path = outfolder / "metrology" / "metrology_report.pdf"
         with metrics.phase("Report Generation"):

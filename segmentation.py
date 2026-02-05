@@ -339,16 +339,15 @@ class SegmentationInference:
         if self.config.apply_normalization:
             tensor = self.normalize_gpu(tensor)
 
-        orig_shape = tensor.shape  # (X, Y, Z)
-        roi = self.config.roi_size
-        fits_in_roi = all(s <= r for s, r in zip(orig_shape, roi))
-
         # Shape to [1, 1, X, Y, Z]
         tensor = tensor.unsqueeze(0).unsqueeze(0)
 
         with torch.no_grad():
+            orig_shape = tensor.shape[2:]
+            roi = self.config.roi_size
+            fits_in_roi = all(s <= r for s, r in zip(orig_shape, roi))
             if fits_in_roi:
-                # Direct inference: symmetric pad to roi_size, run model, unpad
+                # Symmetric pad to roi_size (needed for InstanceNorm consistency)
                 pad = []
                 for dim in reversed(range(3)):
                     diff = roi[dim] - orig_shape[dim]
@@ -356,7 +355,6 @@ class SegmentationInference:
                     pad.extend([half, diff - half])
                 padded = torch.nn.functional.pad(tensor, pad, mode="constant", value=0.0)
                 logits = self._predictor(padded)
-                # Symmetric unpad
                 slices = []
                 for dim in range(3):
                     diff = roi[dim] - orig_shape[dim]
@@ -364,10 +362,10 @@ class SegmentationInference:
                     slices.append(slice(half, half + orig_shape[dim]))
                 logits = logits[:, :, slices[0], slices[1], slices[2]]
             else:
-                # Oversized crop: use sliding window inference
+                # Oversized: use sliding_window_inference
                 logits = sliding_window_inference(
                     inputs=tensor,
-                    roi_size=roi,
+                    roi_size=self.config.roi_size,
                     sw_batch_size=self.config.sw_batch_size,
                     predictor=self._predictor,
                     overlap=self.config.overlap,
