@@ -40,13 +40,16 @@ from utils import log
 class TensorRTPredictor:
     """Wraps a TensorRT engine as a callable predictor for sliding_window_inference.
 
-    Accepts PyTorch CUDA tensors and returns PyTorch CUDA tensors,
-    using GPU memory directly to avoid CPU roundtrips.
+    Accepts PyTorch CUDA tensors and returns PyTorch CUDA tensors.
+    Supports two transfer modes:
+    - GPU direct: memcpy_dtod (fast, requires pycuda/PyTorch context compatibility)
+    - Host relay: GPU→CPU→GPU via pinned memory (slower but universally compatible)
+
+    Auto-detects the best mode at init time with a test transfer.
     """
 
     def __init__(self, engine_path: str | Path, num_classes: int = 5):
         import tensorrt as trt
-        import pycuda.autoinit  # noqa: F401
         import pycuda.driver as cuda
 
         self._trt = trt
@@ -54,6 +57,17 @@ class TensorRTPredictor:
 
         engine_path = Path(engine_path)
         log(f"Loading TensorRT engine: {engine_path}")
+
+        # Try GPU direct mode first (pycuda.autoinit shares PyTorch's context)
+        self._use_gpu_direct = False
+        self._ctx = None
+        try:
+            import pycuda.autoinit  # noqa: F401
+            self._use_gpu_direct = True
+        except Exception:
+            # autoinit failed, fall back to manual context
+            cuda.init()
+            self._ctx = cuda.Device(0).make_context()
 
         logger = trt.Logger(trt.Logger.WARNING)
         runtime = trt.Runtime(logger)
@@ -69,6 +83,7 @@ class TensorRTPredictor:
         self._output_name = None
         self._d_input = None
         self._d_output = None
+        self._input_shape = None
         self._output_shape = None
 
         for i in range(self.engine.num_io_tensors):
@@ -78,6 +93,7 @@ class TensorRTPredictor:
             nbytes = int(np.prod(shape)) * np.dtype(np.float32).itemsize
             if mode == trt.TensorIOMode.INPUT:
                 self._input_name = name
+                self._input_shape = tuple(shape)
                 self._d_input = cuda.mem_alloc(nbytes)
                 self.context.set_tensor_address(name, int(self._d_input))
                 log(f"  TRT input '{name}': shape={tuple(shape)}")
@@ -88,20 +104,37 @@ class TensorRTPredictor:
                 self.context.set_tensor_address(name, int(self._d_output))
                 log(f"  TRT output '{name}': shape={tuple(shape)}")
 
-        log("TensorRT engine loaded successfully")
+        # Validate GPU direct mode with a test transfer
+        if self._use_gpu_direct:
+            try:
+                test_tensor = torch.zeros(self._input_shape, dtype=torch.float32, device="cuda")
+                nbytes = test_tensor.nelement() * test_tensor.element_size()
+                cuda.memcpy_dtod_async(self._d_input, test_tensor.data_ptr(), nbytes, self.stream)
+                self.stream.synchronize()
+                del test_tensor
+            except Exception as e:
+                log(f"GPU direct transfer failed ({e}), falling back to host relay mode")
+                self._use_gpu_direct = False
+                cuda.init()
+                self._ctx = cuda.Device(0).make_context()
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        """Run TRT inference on a PyTorch CUDA tensor.
+        # Pre-allocate pinned host buffers for host relay mode
+        if not self._use_gpu_direct:
+            self._h_input = cuda.pagelocked_empty(
+                int(np.prod(self._input_shape)), dtype=np.float32
+            )
+            self._h_output = cuda.pagelocked_empty(
+                int(np.prod(self._output_shape)), dtype=np.float32
+            )
+            # Pop manual context so PyTorch can use its own
+            if self._ctx is not None:
+                self._ctx.pop()
 
-        Uses direct GPU-to-GPU memory transfer via data pointers
-        to avoid CPU roundtrips.
+        mode_str = "GPU direct (dtod)" if self._use_gpu_direct else "host relay (htod/dtoh)"
+        log(f"TensorRT engine loaded successfully, transfer mode: {mode_str}")
 
-        Args:
-            x: Input tensor of shape (B, 1, X, Y, Z) on CUDA
-
-        Returns:
-            Output tensor of shape (B, num_classes, X, Y, Z) on CUDA
-        """
+    def _call_gpu_direct(self, x: torch.Tensor) -> torch.Tensor:
+        """Fast path: GPU-to-GPU memory transfer via data pointers."""
         cuda = self._cuda
         batch_size = x.shape[0]
 
@@ -109,21 +142,17 @@ class TensorRTPredictor:
         for b in range(batch_size):
             sample = x[b : b + 1].contiguous().float()
 
-            # Allocate output tensor on same CUDA device
             output_tensor = torch.empty(
                 self._output_shape, dtype=torch.float32, device=x.device
             )
 
-            # GPU-to-GPU copy using data pointers (no CPU roundtrip)
             input_nbytes = sample.nelement() * sample.element_size()
             output_nbytes = output_tensor.nelement() * output_tensor.element_size()
 
             cuda.memcpy_dtod_async(
                 self._d_input, sample.data_ptr(), input_nbytes, self.stream
             )
-
             self.context.execute_async_v3(stream_handle=self.stream.handle)
-
             cuda.memcpy_dtod_async(
                 output_tensor.data_ptr(), self._d_output, output_nbytes, self.stream
             )
@@ -134,6 +163,52 @@ class TensorRTPredictor:
         if batch_size == 1:
             return outputs[0]
         return torch.cat(outputs, dim=0)
+
+    def _call_host_relay(self, x: torch.Tensor) -> torch.Tensor:
+        """Compatible path: GPU→CPU→TRT→CPU→GPU via pinned host memory."""
+        cuda = self._cuda
+        batch_size = x.shape[0]
+
+        outputs = []
+        for b in range(batch_size):
+            sample = x[b : b + 1].contiguous().float()
+            h_in = sample.cpu().numpy().ravel()
+            np.copyto(self._h_input, h_in)
+
+            self._ctx.push()
+
+            cuda.memcpy_htod(self._d_input, self._h_input)
+            self.context.execute_async_v3(stream_handle=self.stream.handle)
+            cuda.memcpy_dtoh_async(self._h_output, self._d_output, self.stream)
+            self.stream.synchronize()
+
+            self._ctx.pop()
+
+            output_tensor = torch.from_numpy(
+                self._h_output.reshape(self._output_shape).copy()
+            ).to(x.device)
+
+            outputs.append(output_tensor)
+
+        if batch_size == 1:
+            return outputs[0]
+        return torch.cat(outputs, dim=0)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """Run TRT inference on a PyTorch CUDA tensor.
+
+        Automatically uses GPU direct or host relay depending on
+        hardware compatibility detected at init time.
+
+        Args:
+            x: Input tensor of shape (B, 1, X, Y, Z) on CUDA
+
+        Returns:
+            Output tensor of shape (B, num_classes, X, Y, Z) on CUDA
+        """
+        if self._use_gpu_direct:
+            return self._call_gpu_direct(x)
+        return self._call_host_relay(x)
 
 # =============================================================================
 # Post-processing utilities
