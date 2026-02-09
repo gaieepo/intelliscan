@@ -5,13 +5,15 @@
 # Project-Specific Ignores
 # ================================
 
-# Models directory - ignore trained model weights
-*.pth
-*.pt
-*.onnx
-*.h5
-*.pb
-*.tflite
+# Models directory - model weights are tracked for sharing
+# *.pth
+# *.pt
+# *.ckpt
+# *.onnx
+# *.h5
+# *.pb
+# *.tflite
+# *.engine
 
 # Output directory - ignore processing results
 output/
@@ -263,7 +265,7 @@ wandb/
 
 # Data files (large datasets)
 *.hdf5
-*.h5
+# *.h5
 
 # Pickle files
 *.pkl

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 3D Mask Post-Processing and Metrology Analysis
 
