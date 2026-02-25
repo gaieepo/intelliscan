@@ -62,6 +62,7 @@ class PipelineConfig:
     output_base: str = "output"
     detection_model: str = "models/detection_model.pt"
     segmentation_model: str = "models/segmentation_model.ckpt"
+    tag: str = ""
     use_combined_seg_metrology: bool = False
     use_inmemory_detection: bool = False
     verbose: bool = True
@@ -79,7 +80,6 @@ def process_segmentation_and_metrology_combined(
     engine: SegmentationInference,
     volume: np.ndarray,
     bboxes: np.ndarray,
-    seg_output_dir: Path,
     metrology_output_dir: Path,
     clean_mask: bool = MAKE_CLEAN_DEFAULT,
 ) -> tuple[list, pd.DataFrame]:
@@ -94,7 +94,6 @@ def process_segmentation_and_metrology_combined(
         engine: Initialized SegmentationInference instance
         volume: Full 3D volume array
         bboxes: Array of bboxes [N, 6] format [x_min, x_max, y_min, y_max, z_min, z_max]
-        seg_output_dir: Directory to save per-bbox predictions
         metrology_output_dir: Directory to save metrology CSV
         clean_mask: Whether to apply morphological cleaning to masks
 
@@ -333,12 +332,13 @@ def process_single_file(
     logbook = PipelineLogbook(config.output_base)
 
     # Check if should process
-    should_run, reason = logbook.should_process(input_file, force=force)
+    tag = config.tag
+    should_run, reason = logbook.should_process(input_file, force=force, tag=tag)
     if not should_run:
         return {"status": "skipped", "input_file": str(input_file), "reason": reason}
 
-    # Get output directory using sample ID extraction
-    outfolder = logbook.get_output_dir(input_file)
+    # Get output directory using sample ID extraction + tag
+    outfolder = logbook.get_output_dir(input_file, tag=tag)
     outfolder.mkdir(parents=True, exist_ok=True)
 
     # Mark job as started
@@ -346,10 +346,14 @@ def process_single_file(
         input_file,
         outfolder,
         config={
+            "tag": tag,
+            "detection_model": config.detection_model,
+            "segmentation_model": config.segmentation_model,
             "use_combined_seg_metrology": config.use_combined_seg_metrology,
             "use_inmemory_detection": config.use_inmemory_detection,
             "clean_mask": config.clean_mask,
         },
+        tag=tag,
     )
 
     views = ["view1", "view2"]
@@ -499,7 +503,6 @@ def process_single_file(
                     engine=engine,
                     volume=data3d,
                     bboxes=bb_3d,
-                    seg_output_dir=seg_output_dir,
                     metrology_output_dir=outfolder / "metrology",
                     clean_mask=config.clean_mask,
                 )
@@ -569,7 +572,7 @@ def process_single_file(
         log(f"Report generated at {report_path.parent}")
 
         # Mark job as completed
-        logbook.mark_completed(input_file, metrics.summary())
+        logbook.mark_completed(input_file, metrics.summary(), tag=tag)
 
         return {
             "status": "completed",
@@ -587,7 +590,7 @@ def process_single_file(
         metrics.save(str(outfolder / "metrics.json"))
 
         # Mark job as failed
-        logbook.mark_failed(input_file, str(e))
+        logbook.mark_failed(input_file, str(e), tag=tag)
 
         return {
             "status": "failed",
@@ -623,12 +626,18 @@ Examples:
     parser.add_argument("--trt", action="store_true", help="Use TensorRT backend for segmentation")
     parser.add_argument("--trt-engine", type=str, default=None, help="Path to TensorRT engine file")
     parser.add_argument("--ai-analysis", action="store_true", help="Enable AI analysis in PDF report")
+    parser.add_argument("--detection-model", type=str, default="models/detection_model.pt", help="Path to YOLO detection model")
+    parser.add_argument("--segmentation-model", type=str, default="models/segmentation_model.ckpt", help="Path to segmentation model checkpoint")
+    parser.add_argument("--tag", "-t", type=str, default="", help="Tag to differentiate output folders (e.g. output/SN002_<tag>/)")
 
     args = parser.parse_args()
 
     # Create config from args
     config = PipelineConfig(
         output_base=args.output,
+        detection_model=args.detection_model,
+        segmentation_model=args.segmentation_model,
+        tag=args.tag,
         verbose=not args.quiet,
         use_inmemory_detection=args.inmemory,
         use_trt=args.trt,
@@ -643,14 +652,16 @@ Examples:
         if not jobs:
             print("No jobs in logbook")
         else:
-            print(f"{'Status':<12} {'Sample':<12} {'Started':<20} {'Input File'}")
-            print("-" * 80)
+            print(f"{'Status':<12} {'Sample':<20} {'Started':<20} {'Input File'}")
+            print("-" * 90)
             for job in jobs:
                 sample_id = PipelineLogbook.extract_sample_id(job.get("input_path", ""))
+                job_tag = job.get("config", {}).get("tag", "")
+                label = f"{sample_id}_{job_tag}" if job_tag else sample_id
                 status = job.get("status", "unknown")
                 started = job.get("started_at", "")
                 input_path = job.get("input_path", "")
-                print(f"{status:<12} {sample_id:<12} {started:<20} {input_path}")
+                print(f"{status:<12} {label:<20} {started:<20} {input_path}")
         return
 
     # Determine input files

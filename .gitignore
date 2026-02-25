@@ -19,6 +19,7 @@ files.txt
 
 # Output directory - ignore processing results
 output/
+output-*/
 
 # Generated images and visualizations
 *.jpg

@@ -563,17 +563,36 @@ class PipelineLogbook:
         # Fallback: use full parent name if no SNxxx pattern found
         return parent_name
 
-    def get_output_dir(self, input_path: str | Path) -> Path:
+    def get_output_dir(self, input_path: str | Path, tag: str = "") -> Path:
         """Get the output directory for an input file.
 
         Args:
             input_path: Path to input file
+            tag: Optional tag to differentiate output folders
 
         Returns:
-            Output directory path (e.g., output/SN002)
+            Output directory path (e.g., output/SN002 or output/SN002_modelA)
         """
         sample_id = self.extract_sample_id(input_path)
-        return self.output_base / sample_id
+        folder_name = f"{sample_id}_{tag}" if tag else sample_id
+        return self.output_base / folder_name
+
+    @staticmethod
+    def _job_key(input_path: str | Path, tag: str = "") -> str:
+        """Build the logbook key for a job.
+
+        Incorporates tag so the same input file with different tags
+        are tracked as independent jobs.
+
+        Args:
+            input_path: Path to input file
+            tag: Optional tag string
+
+        Returns:
+            Unique job key string
+        """
+        base = str(Path(input_path).resolve())
+        return f"{base}::{tag}" if tag else base
 
     def _check_in_progress_status(self, job: dict) -> tuple[bool, str]:
         """Check if an in-progress job is stale."""
@@ -596,12 +615,13 @@ class PipelineLogbook:
             return True, "input file changed since last processing"
         return False, "already processed (use force=True to rerun)"
 
-    def should_process(self, input_path: str | Path, force: bool = False) -> tuple[bool, str]:
+    def should_process(self, input_path: str | Path, force: bool = False, tag: str = "") -> tuple[bool, str]:
         """Check if a file should be processed.
 
         Args:
             input_path: Path to input file
             force: If True, always return True
+            tag: Optional tag for output isolation
 
         Returns:
             Tuple of (should_process, reason)
@@ -618,7 +638,8 @@ class PipelineLogbook:
 
         try:
             data = self._load()
-            job = data.get("jobs", {}).get(str(input_path.resolve()))
+            key = self._job_key(input_path, tag)
+            job = data.get("jobs", {}).get(key)
 
             if job is None:
                 return True, "not previously processed"
@@ -635,16 +656,17 @@ class PipelineLogbook:
         finally:
             self._release_lock()
 
-    def mark_started(self, input_path: str | Path, output_dir: str | Path, config: dict | None = None):
+    def mark_started(self, input_path: str | Path, output_dir: str | Path, config: dict | None = None, tag: str = ""):
         """Mark a job as started.
 
         Args:
             input_path: Path to input file
             output_dir: Output directory for this job
             config: Optional pipeline configuration
+            tag: Optional tag for output isolation
         """
         input_path = Path(input_path)
-        key = str(input_path.resolve())
+        key = self._job_key(input_path, tag)
 
         if not self._acquire_lock():
             raise RuntimeError("Could not acquire logbook lock")
@@ -664,14 +686,15 @@ class PipelineLogbook:
         finally:
             self._release_lock()
 
-    def mark_completed(self, input_path: str | Path, metrics: dict | None = None):
+    def mark_completed(self, input_path: str | Path, metrics: dict | None = None, tag: str = ""):
         """Mark a job as completed.
 
         Args:
             input_path: Path to input file
             metrics: Optional metrics from processing
+            tag: Optional tag for output isolation
         """
-        key = str(Path(input_path).resolve())
+        key = self._job_key(input_path, tag)
 
         if not self._acquire_lock():
             raise RuntimeError("Could not acquire logbook lock")
@@ -687,14 +710,15 @@ class PipelineLogbook:
         finally:
             self._release_lock()
 
-    def mark_failed(self, input_path: str | Path, error: str):
+    def mark_failed(self, input_path: str | Path, error: str, tag: str = ""):
         """Mark a job as failed.
 
         Args:
             input_path: Path to input file
             error: Error message
+            tag: Optional tag for output isolation
         """
-        key = str(Path(input_path).resolve())
+        key = self._job_key(input_path, tag)
 
         if not self._acquire_lock():
             raise RuntimeError("Could not acquire logbook lock")
@@ -709,16 +733,17 @@ class PipelineLogbook:
         finally:
             self._release_lock()
 
-    def get_job(self, input_path: str | Path) -> dict | None:
+    def get_job(self, input_path: str | Path, tag: str = "") -> dict | None:
         """Get job info for an input file.
 
         Args:
             input_path: Path to input file
+            tag: Optional tag for output isolation
 
         Returns:
             Job dictionary or None if not found
         """
-        key = str(Path(input_path).resolve())
+        key = self._job_key(input_path, tag)
 
         if not self._acquire_lock():
             return None
