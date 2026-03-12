@@ -37,6 +37,10 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
+# Set matplotlib backend to Agg (non-interactive) to prevent GUI errors in threads
+import matplotlib
+matplotlib.use("Agg")
+
 import nibabel as nib
 import numpy as np
 import pandas as pd
@@ -554,6 +558,23 @@ def process_single_file(
                     bb_3d_list=bb_3d[np.newaxis, :] if bb_3d.ndim == 2 else bb_3d,
                 )
                 phase.complete(count=len(results))
+
+        with metrics.phase("GLTF Generation") as phase:
+            from gltf_utils import generate_all_bump_gltfs, generate_gltf_for_sample
+
+            # Use outfolder directly (already includes tag if present)
+            # Extract the folder name and base to match gltf_utils API
+            output_base_path = outfolder.parent
+            sample_folder_name = outfolder.name
+            num_bumps = 0
+            try:
+                log("Generating main GLTF model...")
+                generate_gltf_for_sample(sample_folder_name, output_base_path)
+                log("Generating bump GLTF models...")
+                num_bumps = generate_all_bump_gltfs(sample_folder_name, output_base_path)
+            except Exception as e:
+                log(f"GLTF generation failed: {e}", level="warning")
+            phase.complete(count=num_bumps)
 
         report_path = outfolder / "metrology" / "metrology_report.pdf"
         with metrics.phase("Report Generation"):

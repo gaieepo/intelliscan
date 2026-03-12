@@ -11,6 +11,7 @@ dependencies = [
     "pandas>=2.3.3",
     "python-dotenv>=1.0.0",
     "pillow>=12.0.0",
+    "pyvista>=0.44.0",
     "pycuda>=2026.1",
     "pypdf2>=3.0.1",
     "scikit-image>=0.25.2",
